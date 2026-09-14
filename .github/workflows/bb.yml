@@ -68,7 +68,7 @@ jobs:
 
           from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
           from fastapi.middleware.cors import CORSMiddleware
-          from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
+          from fastapi.responses import FileResponse, HTMLResponse
           from pydantic import BaseModel
 
           app = FastAPI(
@@ -98,7 +98,7 @@ jobs:
           MANIFEST_FILE = FOLDERS["Editor"] / "manifest.json"
           MAX_UPLOAD_SIZE = 1024 * 1024 * 1024  # 1 GB
 
-          # Targeted assets to auto-detect and isolate for editing
+          # Target assets to auto-detect and isolate for editing
           TARGET_FILENAMES = [
               "BP_PlayerPawn.uasset",
               "BP_PlayerPawn.uexp",
@@ -124,7 +124,6 @@ jobs:
 
 
           def scan_for_targets(unpack_dir: Path) -> Dict[str, str]:
-              """Recursively locates targeted files and maps {filename: relative_path_in_unpack}"""
               found_map = {}
               for item in unpack_dir.rglob("*"):
                   if item.is_file() and item.name in TARGET_FILENAMES:
@@ -184,7 +183,7 @@ jobs:
                   with zipfile.ZipFile(source_pak, "r") as archive:
                       archive.extractall(FOLDERS["Unpack"])
               else:
-                  # Binary PAK fallback structure generator
+                  # Binary fallback structure generator
                   dummy_base = FOLDERS["Unpack"] / "ShadowTrackerExtra" / "Content"
                   dummy_base.mkdir(parents=True, exist_ok=True)
                   (dummy_base / "BP_PlayerPawn.uasset").write_bytes(b"\xC1\x83\x2A\x9E_UASSET_HEADER")
@@ -204,13 +203,13 @@ jobs:
               # Search for target files
               target_map = scan_for_targets(FOLDERS["Unpack"])
 
-              # If not found inside pak structure, create template stubs in Unpack
+              # Create fallback files if missing in target pak
               for target in TARGET_FILENAMES:
                   if target not in target_map:
                       dest = FOLDERS["Unpack"] / "Content" / target
                       dest.parent.mkdir(parents=True, exist_ok=True)
                       if target.endswith(".lua"):
-                          dest.write_text(f"-- Default template for {target}\nlocal M = {}\nreturn M\n")
+                          dest.write_text("-- Default template for " + target + "\nlocal M = {}\nreturn M\n")
                       else:
                           dest.write_bytes(b"\x00\x00\x00\x00")
                       target_map[target] = str(dest.relative_to(FOLDERS["Unpack"]))
@@ -310,13 +309,12 @@ jobs:
               with MANIFEST_FILE.open("r") as f:
                   manifest = json.load(f)
 
-              # Maintain original pak name
               original_name = manifest.get("original_pak", "Output.pak")
               final_pak_name = payload.custom_name.strip() if payload.custom_name else original_name
               if not final_pak_name.endswith(".pak"):
                   final_pak_name += ".pak"
 
-              # Sync files from Editor back to their exact internal Unpack path
+              # Sync edited files back to exact relative locations
               target_map = manifest.get("targets", {})
               for filename, rel_path in target_map.items():
                   edited_file = FOLDERS["Editor"] / filename
@@ -326,7 +324,7 @@ jobs:
                       destination.parent.mkdir(parents=True, exist_ok=True)
                       shutil.copy2(edited_file, destination)
 
-              # Repack Unpack directory into Repack/{final_pak_name}
+              # Repack archive
               out_path = FOLDERS["Repack"] / final_pak_name
               with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_out:
                   for item in FOLDERS["Unpack"].rglob("*"):
@@ -395,36 +393,29 @@ jobs:
                           --border: #232f48;
                           --accent: #38bdf8;
                           --green: #22c55e;
-                          --amber: #f59e0b;
                           --text: #f8fafc;
                           --sub: #94a3b8;
                       }
                       * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
                       body { background: var(--bg); color: var(--text); padding: 14px; display: flex; justify-content: center; }
                       .container { width: 100%; max-width: 540px; display: flex; flex-direction: column; gap: 14px; }
-                      
                       .header { display: flex; justify-content: space-between; align-items: center; padding: 8px 4px; }
                       .header h1 { font-size: 19px; font-weight: 800; color: #fff; }
                       .status-tag { background: #1e293b; color: var(--green); border: 1px solid var(--border); padding: 4px 10px; border-radius: 99px; font-size: 11px; font-weight: 600; }
-
                       .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
                       .card-title { font-size: 13px; font-weight: 700; color: var(--sub); text-transform: uppercase; letter-spacing: 0.5px; }
-
                       select, input, button, textarea { width: 100%; padding: 12px; border-radius: 10px; border: 1px solid var(--border); background: #0c121e; color: var(--text); font-size: 14px; outline: none; }
                       button { font-weight: 700; cursor: pointer; border: none; transition: 0.15s; }
                       button:active { transform: scale(0.98); }
-                      
                       .btn-blue { background: var(--accent); color: #081a2e; }
                       .btn-green { background: var(--green); color: #02240d; }
                       .btn-dark { background: #1e293b; color: var(--text); border: 1px solid var(--border); }
-
                       .file-chip { display: flex; justify-content: space-between; align-items: center; background: #0b1120; border: 1px solid var(--border); padding: 12px; border-radius: 12px; }
                       .file-meta { display: flex; flex-direction: column; gap: 3px; }
                       .file-name { font-size: 13px; font-weight: 600; color: #f1f5f9; }
                       .file-tag { font-size: 10px; color: var(--accent); }
                       .file-actions { display: flex; gap: 6px; }
                       .btn-sm { padding: 6px 12px; font-size: 12px; border-radius: 8px; width: auto; }
-
                       textarea { font-family: monospace; font-size: 12px; line-height: 1.5; resize: vertical; min-height: 200px; color: #7dd3fc; }
                       .log-box { background: #060911; border: 1px solid var(--border); border-radius: 10px; padding: 10px; font-family: monospace; font-size: 11px; color: #a5f3fc; max-height: 90px; overflow-y: auto; white-space: pre-wrap; }
                   </style>
@@ -436,7 +427,6 @@ jobs:
                           <span class="status-tag">● Ready</span>
                       </div>
 
-                      <!-- Step 1: Select PAK & Auto-Extract -->
                       <div class="card">
                           <div class="card-title">1. Original PAK File</div>
                           <select id="pakDropdown"><option>Loading PAK list...</option></select>
@@ -447,7 +437,6 @@ jobs:
                           </div>
                       </div>
 
-                      <!-- Step 2: Isolated Target Files in Editor -->
                       <div class="card">
                           <div class="card-title">2. Target Files In Editor</div>
                           <div id="targetFilesContainer" style="display: flex; flex-direction: column; gap: 8px;">
@@ -455,14 +444,12 @@ jobs:
                           </div>
                       </div>
 
-                      <!-- Step 3: In-App Code / Script Editor -->
                       <div class="card" id="codeEditorCard" style="display: none;">
                           <div class="card-title" id="editingFileName">Editing: None</div>
                           <textarea id="fileContentBox" spellcheck="false"></textarea>
                           <button class="btn-blue" onclick="saveActiveFile()">💾 Save Changes to Editor</button>
                       </div>
 
-                      <!-- Step 4: Repack with Original PAK Name -->
                       <div class="card">
                           <div class="card-title">3. Repack to Original Name</div>
                           <input type="text" id="targetPakNameDisplay" readonly placeholder="Original PAK Name will appear here">
@@ -742,5 +729,5 @@ jobs:
             exit 0
           fi
 
-          git commit -m "feat: target extraction for BP_PlayerPawn and Lua assets with repack"
+          git commit -m "fix: resolve f-string syntax error and enable target asset extraction"
           git push origin HEAD:main
