@@ -31,16 +31,12 @@ jobs:
         shell: bash
         run: |
           set -e
-          mkdir -p server/api
-          mkdir -p server/services
           mkdir -p server/workspace/Original
           mkdir -p server/workspace/Unpack
           mkdir -p server/workspace/Editor
           mkdir -p server/workspace/Repack
 
           touch server/__init__.py
-          touch server/api/__init__.py
-          touch server/services/__init__.py
 
       # --------------------------------------------------
       # REQUIREMENTS
@@ -54,38 +50,31 @@ jobs:
           python-multipart>=0.0.20,<1.0.0
           pydantic>=2.10.0,<3.0.0
           aiofiles>=24.1.0,<25.0.0
-          zstandard>=0.23.0,<1.0.0
           EOF
 
       # --------------------------------------------------
-      # MAIN FASTAPI SERVER (APP + WEB READY)
+      # MAIN FASTAPI SERVER
       # --------------------------------------------------
       - name: Create main.py
         shell: bash
         run: |
           cat > server/main.py <<'PY'
+          import json
           import os
           import shutil
-          import time
+          import zipfile
           from pathlib import Path
           from typing import Any, Dict, List, Optional
 
-          from fastapi import (
-              FastAPI,
-              File,
-              HTTPException,
-              Query,
-              UploadFile,
-              status,
-          )
+          from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
           from fastapi.middleware.cors import CORSMiddleware
-          from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+          from fastapi.responses import FileResponse, HTMLResponse
           from pydantic import BaseModel
 
           app = FastAPI(
-              title="Pak Workspace Enterprise API",
-              version="2.0.0",
-              description="High-performance backend API for mobile apps and web workspace."
+              title="Pak Automation Engine",
+              version="3.0.0",
+              description="Automated PAK unpacker, property patcher, and repacker."
           )
 
           app.add_middleware(
@@ -107,456 +96,438 @@ jobs:
           }
 
           MAX_UPLOAD_SIZE = 1024 * 1024 * 1024  # 1 GB
+          CONFIG_FILE = FOLDERS["Editor"] / "patch_values.json"
 
-          for directory in FOLDERS.values():
-              directory.mkdir(parents=True, exist_ok=True)
+          for d in FOLDERS.values():
+              d.mkdir(parents=True, exist_ok=True)
+
+          # Default template agar pak file raw ya non-zip ho
+          DEFAULT_CONFIG = {
+              "target_asset": "default",
+              "variables": {
+                  "bypass_checks": True,
+                  "frame_rate_limit": 90,
+                  "render_quality": 2,
+                  "texture_scale": 1.0,
+                  "developer_flag": 1
+              }
+          }
 
 
           # --------------------------------------------------
-          # UTILITY & SECURITY HELPERS
+          # HELPERS
           # --------------------------------------------------
 
-          def format_size(size_bytes: int) -> str:
-              if size_bytes < 1024:
-                  return f"{size_bytes} B"
-              elif size_bytes < 1024 * 1024:
-                  return f"{size_bytes / 1024:.2f} KB"
-              elif size_bytes < 1024 * 1024 * 1024:
-                  return f"{size_bytes / (1024 * 1024):.2f} MB"
-              return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
-
-
-          def resolve_safe_path(folder_name: str, filename: str) -> Path:
+          def safe_path(folder_name: str, filename: str) -> Path:
               if folder_name not in FOLDERS:
-                  raise HTTPException(
-                      status_code=status.HTTP_400_BAD_REQUEST,
-                      detail=f"Invalid folder: {folder_name}"
-                  )
-
-              target_dir = FOLDERS[folder_name].resolve()
+                  raise HTTPException(status_code=400, detail="Invalid folder specified.")
               clean_name = Path(filename).name
-              file_path = (target_dir / clean_name).resolve()
-
-              # Prevent path traversal
-              if not str(file_path).startswith(str(target_dir)):
-                  raise HTTPException(
-                      status_code=status.HTTP_403_FORBIDDEN,
-                      detail="Access denied: Directory traversal detected."
-                  )
-
-              return file_path
+              path = (FOLDERS[folder_name] / clean_name).resolve()
+              if not str(path).startswith(str(FOLDERS[folder_name].resolve())):
+                  raise HTTPException(status_code=403, detail="Security violation.")
+              return path
 
 
-          def scan_folder(directory: Path, folder_key: str) -> List[Dict[str, Any]]:
-              if not directory.exists():
-                  return []
-
-              results = []
-              for item in sorted(directory.rglob("*")):
-                  if item.is_file() and not item.name.startswith("."):
-                      stat = item.stat()
-                      rel_path = str(item.relative_to(directory))
-                      results.append({
-                          "name": item.name,
-                          "relative_path": rel_path,
-                          "folder": folder_key,
-                          "size_bytes": stat.st_size,
-                          "size_formatted": format_size(stat.st_size),
-                          "modified_at": int(stat.st_mtime),
-                          "download_url": f"/api/download/{folder_key}/{rel_path}"
-                      })
-              return results
+          def get_file_list(folder_name: str, ext: Optional[str] = None) -> List[str]:
+              target = FOLDERS[folder_name]
+              files = [f.name for f in target.iterdir() if f.is_file() and not f.name.startswith("README")]
+              if ext:
+                  files = [f for f in files if f.endswith(ext)]
+              return sorted(files)
 
 
           # --------------------------------------------------
-          # MODELS
+          # SCHEMAS
           # --------------------------------------------------
 
-          class ProcessRequest(BaseModel):
+          class UnpackPayload(BaseModel):
               filename: str
-              clean_destination: bool = False
+
+          class PatchUpdatePayload(BaseModel):
+              variables: Dict[str, Any]
+
+          class RepackPayload(BaseModel):
+              output_name: Optional[str] = None
 
 
           # --------------------------------------------------
-          # CORE API ENDPOINTS (MOBILE & SYSTEM)
+          # CORE APIS (FOR ANDROID / IOS APPS)
           # --------------------------------------------------
 
           @app.get("/api/health")
           async def health():
-              return {
-                  "status": "healthy",
-                  "service": "pak-server-core",
-                  "timestamp": int(time.time()),
-                  "version": "2.0.0"
+              return {"status": "active", "service": "pak-engine"}
+
+
+          @app.get("/api/original/paks")
+          async def list_original_paks():
+              """App me dropdown ya list bharne ke liye sabhi .pak files return karta hai"""
+              paks = get_file_list("Original", ".pak")
+              return {"status": "ok", "total": len(paks), "files": paks}
+
+
+          @app.post("/api/pak/unpack")
+          async def unpack_pak(payload: UnpackPayload):
+              """Original pak ko unpack karta hai aur Editor me editable values load karta hai"""
+              target_pak = safe_path("Original", payload.filename)
+              if not target_pak.exists():
+                  raise HTTPException(status_code=404, detail=f"{payload.filename} nahi mila.")
+
+              # Clean unpack folder
+              for item in FOLDERS["Unpack"].iterdir():
+                  if not item.name.startswith("README"):
+                      if item.is_file(): item.unlink()
+                      elif item.is_dir(): shutil.rmtree(item)
+
+              extracted_files = []
+              is_zip_based = zipfile.is_zipfile(target_pak)
+
+              if is_zip_based:
+                  with zipfile.ZipFile(target_pak, "r") as archive:
+                      archive.extractall(FOLDERS["Unpack"])
+                      extracted_files = archive.namelist()
+              else:
+                  # Binary payload unpack handling
+                  raw_copy = FOLDERS["Unpack"] / target_pak.name
+                  shutil.copy2(target_pak, raw_copy)
+                  extracted_files.append(raw_copy.name)
+
+              # Initialize Editor config for easy app editing
+              config_data = {
+                  "source_pak": payload.filename,
+                  "is_zip": is_zip_based,
+                  "variables": DEFAULT_CONFIG["variables"]
               }
 
+              # Agar already unpacked files me json config hai to use load kare
+              for ext_file in FOLDERS["Unpack"].rglob("*.json"):
+                  try:
+                      with ext_file.open("r") as f:
+                          config_data["variables"] = json.load(f)
+                          break
+                  except Exception:
+                      pass
 
-          @app.get("/api/status")
-          async def system_status():
-              stats = {}
-              total_files = 0
-              total_bytes = 0
-
-              for name, path in FOLDERS.items():
-                  files = scan_folder(path, name)
-                  folder_size = sum(f["size_bytes"] for f in files)
-                  stats[name] = {
-                      "count": len(files),
-                      "size_bytes": folder_size,
-                      "size_formatted": format_size(folder_size)
-                  }
-                  total_files += len(files)
-                  total_bytes += folder_size
-
-              return {
-                  "status": "online",
-                  "totals": {
-                      "files": total_files,
-                      "storage_bytes": total_bytes,
-                      "storage_formatted": format_size(total_bytes)
-                  },
-                  "folders": stats
-              }
-
-
-          @app.get("/api/workspace")
-          async def get_workspace():
-              return {
-                  "status": "ok",
-                  "workspace": {
-                      name: scan_folder(path, name)
-                      for name, path in FOLDERS.items()
-                  }
-              }
-
-
-          @app.get("/api/files/{folder}")
-          async def get_folder_files(folder: str):
-              if folder not in FOLDERS:
-                  raise HTTPException(
-                      status_code=status.HTTP_400_BAD_REQUEST,
-                      detail="Invalid target folder."
-                  )
-              return {
-                  "status": "ok",
-                  "folder": folder,
-                  "files": scan_folder(FOLDERS[folder], folder)
-              }
-
-
-          @app.post("/api/upload")
-          async def upload_file(
-              file: UploadFile = File(...),
-              folder: str = Query("Original", description="Destination folder")
-          ):
-              if folder not in FOLDERS:
-                  raise HTTPException(
-                      status_code=status.HTTP_400_BAD_REQUEST,
-                      detail=f"Target folder '{folder}' does not exist."
-                  )
-
-              filename = Path(file.filename or "uploaded_asset.bin").name
-              destination = resolve_safe_path(folder, filename)
-              total_bytes = 0
-
-              try:
-                  with destination.open("wb") as buffer:
-                      while True:
-                          chunk = await file.read(1024 * 1024)
-                          if not chunk:
-                              break
-                          total_bytes += len(chunk)
-                          if total_bytes > MAX_UPLOAD_SIZE:
-                              destination.unlink(missing_ok=True)
-                              raise HTTPException(
-                                  status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                                  detail="File exceeds maximum allowed limit (1GB)."
-                              )
-                          buffer.write(chunk)
-              finally:
-                  await file.close()
+              with CONFIG_FILE.open("w") as f:
+                  json.dump(config_data, f, indent=4)
 
               return {
                   "status": "success",
-                  "filename": filename,
-                  "folder": folder,
-                  "size_bytes": total_bytes,
-                  "size_formatted": format_size(total_bytes),
-                  "download_url": f"/api/download/{folder}/{filename}"
+                  "message": f"{payload.filename} successfully unpacked.",
+                  "files_extracted": len(extracted_files),
+                  "editable_config": config_data
+              }
+
+
+          @app.get("/api/editor/values")
+          async def get_editor_values():
+              """Current editable variables return karta hai jo app me show honge"""
+              if not CONFIG_FILE.exists():
+                  return {"status": "empty", "variables": {}, "message": "Pehle pak unpack kare."}
+
+              with CONFIG_FILE.open("r") as f:
+                  data = json.load(f)
+
+              return {
+                  "status": "ok",
+                  "source_pak": data.get("source_pak", "unknown"),
+                  "variables": data.get("variables", {})
+              }
+
+
+          @app.post("/api/editor/update")
+          async def update_editor_values(payload: PatchUpdatePayload):
+              """App se modified values save karne ka endpoint"""
+              current = DEFAULT_CONFIG
+              if CONFIG_FILE.exists():
+                  with CONFIG_FILE.open("r") as f:
+                      current = json.load(f)
+
+              current["variables"] = payload.variables
+
+              with CONFIG_FILE.open("w") as f:
+                  json.dump(current, f, indent=4)
+
+              return {
+                  "status": "success",
+                  "message": "Values updated successfully.",
+                  "variables": current["variables"]
+              }
+
+
+          @app.post("/api/pak/repack")
+          async def repack_pak(payload: RepackPayload):
+              """Modified values ko merge karke final .pak file Repack folder me create karta hai"""
+              if not CONFIG_FILE.exists():
+                  raise HTTPException(status_code=400, detail="Pehle file unpack karke edit kare.")
+
+              with CONFIG_FILE.open("r") as f:
+                  config = json.load(f)
+
+              source_pak = config.get("source_pak", "asset.pak")
+              clean_name = Path(payload.output_name if payload.output_name else f"repacked_{source_pak}").name
+              if not clean_name.endswith(".pak"):
+                  clean_name += ".pak"
+
+              out_path = FOLDERS["Repack"] / clean_name
+
+              # Write patched values into Repacked binary archive
+              with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_out:
+                  # Inject modified configuration
+                  zip_out.writestr("patch_manifest.json", json.dumps(config["variables"], indent=2))
+
+                  # Include all other unpacked files
+                  for p in FOLDERS["Unpack"].rglob("*"):
+                      if p.is_file() and not p.name.startswith("README"):
+                          rel = p.relative_to(FOLDERS["Unpack"])
+                          zip_out.write(p, arcname=str(rel))
+
+              return {
+                  "status": "success",
+                  "message": "Repack completed successfully!",
+                  "filename": clean_name,
+                  "size_bytes": out_path.stat().st_size,
+                  "download_url": f"/api/download/Repack/{clean_name}"
               }
 
 
           @app.get("/api/download/{folder}/{filename:path}")
           async def download_file(folder: str, filename: str):
-              target_file = resolve_safe_path(folder, filename)
-
-              if not target_file.is_file():
-                  raise HTTPException(
-                      status_code=status.HTTP_404_NOT_FOUND,
-                      detail="Requested asset not found."
-                  )
-
+              file_path = safe_path(folder, filename)
+              if not file_path.is_file():
+                  raise HTTPException(status_code=404, detail="File nahi mili.")
               return FileResponse(
-                  path=target_file,
-                  filename=target_file.name,
+                  path=file_path,
+                  filename=file_path.name,
                   media_type="application/octet-stream"
               )
 
 
-          @app.delete("/api/files/{folder}/{filename:path}")
-          async def delete_file(folder: str, filename: str):
-              target_file = resolve_safe_path(folder, filename)
+          @app.post("/api/upload")
+          async def upload_pak(file: UploadFile = File(...)):
+              name = Path(file.filename or "uploaded.pak").name
+              target = safe_path("Original", name)
+              total = 0
+              with target.open("wb") as buffer:
+                  while True:
+                      chunk = await file.read(1024 * 1024)
+                      if not chunk: break
+                      total += len(chunk)
+                      if total > MAX_UPLOAD_SIZE:
+                          target.unlink(missing_ok=True)
+                          raise HTTPException(status_code=413, detail="File size limit exceeded.")
+                      buffer.write(chunk)
 
-              if not target_file.is_file():
-                  raise HTTPException(
-                      status_code=status.HTTP_404_NOT_FOUND,
-                      detail="File does not exist."
-                  )
-
-              target_file.unlink()
-              return {
-                  "status": "success",
-                  "message": f"Deleted {filename} from {folder}."
-              }
-
-
-          @app.post("/api/workspace/clear")
-          async def clear_workspace(folder: Optional[str] = Query(None)):
-              cleared = []
-              targets = [folder] if folder and folder in FOLDERS else list(FOLDERS.keys())
-
-              for key in targets:
-                  folder_path = FOLDERS[key]
-                  for item in folder_path.iterdir():
-                      if item.name.startswith("README"):
-                          continue
-                      if item.is_file() or item.is_symlink():
-                          item.unlink()
-                      elif item.is_dir():
-                          shutil.rmtree(item)
-                  cleared.append(key)
-
-              return {
-                  "status": "success",
-                  "cleared_folders": cleared
-              }
+              return {"status": "ok", "filename": name, "size": total}
 
 
           # --------------------------------------------------
-          # PIPELINE ACTIONS (UNPACK & REPACK)
-          # --------------------------------------------------
-
-          @app.post("/api/process/unpack")
-          async def trigger_unpack(payload: ProcessRequest):
-              source_file = resolve_safe_path("Original", payload.filename)
-
-              if not source_file.is_file():
-                  raise HTTPException(
-                      status_code=status.HTTP_404_NOT_FOUND,
-                      detail="Source file not found in Original folder."
-                  )
-
-              unpack_dir = FOLDERS["Unpack"]
-              editor_dir = FOLDERS["Editor"]
-
-              if payload.clean_destination:
-                  for p in [unpack_dir, editor_dir]:
-                      for item in p.iterdir():
-                          if not item.name.startswith("README"):
-                              if item.is_file(): item.unlink()
-                              elif item.is_dir(): shutil.rmtree(item)
-
-              # Extracted asset pipeline demonstration
-              output_stub = unpack_dir / f"{source_file.stem}_extracted.dat"
-              output_stub.write_bytes(b"EXTRACTED_PAYLOAD_READY_FOR_APP")
-
-              editor_copy = editor_dir / f"{source_file.stem}_editable.json"
-              editor_copy.write_text('{"status": "ready_for_customization", "version": 1}')
-
-              return {
-                  "status": "success",
-                  "message": "Asset unpacked successfully.",
-                  "files_generated": [
-                      f"Unpack/{output_stub.name}",
-                      f"Editor/{editor_copy.name}"
-                  ]
-              }
-
-
-          @app.post("/api/process/repack")
-          async def trigger_repack(payload: ProcessRequest):
-              editor_files = scan_folder(FOLDERS["Editor"], "Editor")
-
-              if not editor_files:
-                  raise HTTPException(
-                      status_code=status.HTTP_400_BAD_REQUEST,
-                      detail="Editor directory has no files to repack."
-                  )
-
-              target_name = payload.filename if payload.filename.endswith(".pak") else f"{payload.filename}.pak"
-              output_pak = resolve_safe_path("Repack", target_name)
-
-              output_pak.write_bytes(b"REPACKED_FINAL_BINARY_ARCHIVE")
-
-              return {
-                  "status": "success",
-                  "message": "Repack completed successfully.",
-                  "output_file": target_name,
-                  "download_url": f"/api/download/Repack/{target_name}"
-              }
-
-
-          # --------------------------------------------------
-          # WEB DASHBOARD (MOBILE-RESPONSIVE)
+          # MODERN MOBILE-FRIENDLY DASHBOARD (/pak)
           # --------------------------------------------------
 
           @app.get("/", response_class=HTMLResponse)
-          async def root():
-              return """
-              <!doctype html>
-              <html lang="en">
-              <head>
-                  <meta charset="utf-8">
-                  <meta name="viewport" content="width=device-width, initial-scale=1">
-                  <title>Enterprise Pak Server</title>
-                  <style>
-                      body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #090d16; color: #f0f6fc; margin: 0; display: flex; align-items: center; justify-content: center; height: 100vh; }
-                      .card { background: #131b2e; border: 1px solid #243049; border-radius: 16px; padding: 40px; text-align: center; max-width: 480px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
-                      h1 { margin: 0 0 12px; font-size: 26px; color: #58a6ff; }
-                      p { color: #8b949e; line-height: 1.5; font-size: 15px; margin-bottom: 24px; }
-                      .btn { display: inline-block; background: #238636; color: white; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: 600; transition: 0.2s ease; }
-                      .btn:hover { background: #2ea043; }
-                  </style>
-              </head>
-              <body>
-                  <div class="card">
-                      <h1>📦 Pak Control Center</h1>
-                      <p>Backend API and Asset Management Gateway is running with Android/iOS application support.</p>
-                      <a href="/pak" class="btn">Open Interactive Console</a>
-                  </div>
-              </body>
-              </html>
-              """
+          async def index():
+              return """<script>window.location.href="/pak";</script>"""
 
 
           @app.get("/pak", response_class=HTMLResponse)
-          async def pak_dashboard():
+          async def mobile_dashboard():
               return """
-              <!doctype html>
+              <!DOCTYPE html>
               <html lang="en">
               <head>
                   <meta charset="utf-8">
-                  <meta name="viewport" content="width=device-width, initial-scale=1">
-                  <title>Pak Workspace Dashboard</title>
+                  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+                  <title>PAK Mod Engine</title>
                   <style>
-                      * { box-sizing: border-box; margin: 0; padding: 0; }
-                      body { background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding-bottom: 50px; }
-                      header { background: #161b22; border-bottom: 1px solid #30363d; padding: 20px 32px; display: flex; justify-content: space-between; align-items: center; }
-                      .badge { background: #238636; color: #fff; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
-                      main { max-width: 1200px; margin: 24px auto; padding: 0 16px; }
-                      .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-bottom: 24px; }
-                      .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 20px; }
-                      .card h3 { font-size: 15px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; }
-                      .card .metric { font-size: 28px; font-weight: 700; margin-top: 8px; color: #58a6ff; }
-                      .toolbar { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 20px; margin-bottom: 24px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
-                      input[type=file], select, button { padding: 10px 14px; border-radius: 8px; border: 1px solid #30363d; background: #21262d; color: #fff; font-size: 14px; }
-                      button { background: #238636; border-color: #2ea043; cursor: pointer; font-weight: 600; }
-                      button:hover { background: #2ea043; }
-                      button.danger { background: #da3633; border-color: #f85149; }
-                      button.danger:hover { background: #b62324; }
-                      .console-box { background: #010409; border: 1px solid #30363d; border-radius: 12px; padding: 16px; font-family: monospace; font-size: 13px; color: #7ee787; min-height: 200px; max-height: 450px; overflow-y: auto; white-space: pre-wrap; }
+                      :root {
+                          --bg: #090d16;
+                          --card: #121826;
+                          --border: #222f46;
+                          --accent: #38bdf8;
+                          --accent-glow: rgba(56, 189, 248, 0.2);
+                          --green: #22c55e;
+                          --text: #f1f5f9;
+                          --subtext: #94a3b8;
+                      }
+                      * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; -webkit-tap-highlight-color: transparent; }
+                      body { background: var(--bg); color: var(--text); padding: 16px; display: flex; justify-content: center; }
+                      .container { width: 100%; max-width: 520px; display: flex; flex-direction: column; gap: 14px; }
+                      
+                      /* Header */
+                      .header { display: flex; justify-content: space-between; align-items: center; padding: 12px 6px; }
+                      .header h1 { font-size: 20px; font-weight: 800; display: flex; align-items: center; gap: 8px; }
+                      .badge { background: #1e293b; border: 1px solid var(--border); padding: 4px 10px; border-radius: 99px; font-size: 11px; color: var(--green); }
+
+                      /* Cards */
+                      .card { background: var(--card); border: 1px solid var(--border); border-radius: 18px; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+                      .card-title { font-size: 14px; font-weight: 700; color: var(--subtext); text-transform: uppercase; letter-spacing: 0.6px; display: flex; align-items: center; gap: 6px; }
+
+                      /* Inputs & Buttons */
+                      select, input, button { width: 100%; padding: 14px; border-radius: 12px; border: 1px solid var(--border); background: #0c121e; color: var(--text); font-size: 14px; outline: none; }
+                      select:focus, input:focus { border-color: var(--accent); }
+                      button { background: #1e293b; font-weight: 700; cursor: pointer; transition: 0.2s ease; border: 1px solid var(--border); }
+                      button:active { transform: scale(0.98); }
+                      .btn-accent { background: var(--accent); color: #051329; border: none; box-shadow: 0 4px 14px var(--accent-glow); }
+                      .btn-green { background: var(--green); color: #022c11; border: none; }
+
+                      /* Property Row */
+                      .prop-row { display: flex; justify-content: space-between; align-items: center; background: #080e1a; padding: 10px 12px; border-radius: 10px; border: 1px solid #192337; }
+                      .prop-label { font-size: 13px; font-weight: 600; color: #cbd5e1; }
+                      .prop-input { width: 120px; padding: 8px; text-align: right; font-size: 13px; }
+
+                      /* Terminal / Output */
+                      .terminal { background: #050810; border: 1px solid var(--border); border-radius: 12px; padding: 12px; font-family: monospace; font-size: 12px; color: #38bdf8; max-height: 120px; overflow-y: auto; white-space: pre-wrap; }
                   </style>
               </head>
               <body>
-                  <header>
-                      <h2>⚙️ Pak Workspace Console</h2>
-                      <span class="badge">● Online 2.0</span>
-                  </header>
-                  <main>
-                      <div class="stats-grid" id="statsGrid"></div>
-
-                      <div class="toolbar">
-                          <input type="file" id="filePicker">
-                          <select id="targetFolder">
-                              <option value="Original">Original</option>
-                              <option value="Editor">Editor</option>
-                              <option value="Repack">Repack</option>
-                          </select>
-                          <button onclick="uploadAsset()">⬆ Upload Asset</button>
-                          <button onclick="loadWorkspace()">🔄 Refresh State</button>
-                          <button class="danger" onclick="clearWorkspace()">🗑 Clear Current</button>
+                  <div class="container">
+                      <div class="header">
+                          <h1>📦 PAK Studio</h1>
+                          <span class="badge">● Engine v3</span>
                       </div>
 
-                      <div class="console-box" id="logConsole">Connecting to workspace engine...</div>
-                  </main>
+                      <!-- 1. Upload & Pak Selection -->
+                      <div class="card">
+                          <div class="card-title">1. Select Original .PAK</div>
+                          <select id="pakSelect">
+                              <option value="">Scanning Original folder...</option>
+                          </select>
+                          <input type="file" id="pakUploader" style="display:none" onchange="uploadFile()">
+                          <div style="display: flex; gap: 8px;">
+                              <button style="flex: 1;" onclick="document.getElementById('pakUploader').click()">⬆ Upload PAK</button>
+                              <button style="flex: 1.5;" class="btn-accent" onclick="unpackSelected()">⚡ Unpack PAK</button>
+                          </div>
+                      </div>
+
+                      <!-- 2. Value Modification (App/Mobile Friendly) -->
+                      <div class="card">
+                          <div class="card-title">2. Modify Values (Editor)</div>
+                          <div id="propContainer" style="display: flex; flex-direction: column; gap: 8px;">
+                              <div style="color: var(--subtext); font-size: 13px; text-align: center; padding: 12px;">Pehle pak unpack kare</div>
+                          </div>
+                      </div>
+
+                      <!-- 3. Repack & Output -->
+                      <div class="card">
+                          <div class="card-title">3. Repack & Build</div>
+                          <input type="text" id="outputName" placeholder="Output file name (optional)">
+                          <button class="btn-green" onclick="repackFile()">🔨 Repack & Generate File</button>
+                          <div id="downloadArea" style="display:none;">
+                              <a id="downloadLink" href="#" target="_blank">
+                                  <button style="background:#0284c7; color:white; border:none; margin-top:4px;">⬇ Download Repacked PAK</button>
+                              </a>
+                          </div>
+                      </div>
+
+                      <!-- Status Terminal -->
+                      <div class="terminal" id="termLog">Engine ready. Select or upload a .pak file to begin.</div>
+                  </div>
 
                   <script>
-                      const logger = document.getElementById("logConsole");
-                      const statsGrid = document.getElementById("statsGrid");
+                      const log = (msg) => {
+                          const t = document.getElementById("termLog");
+                          t.textContent = typeof msg === 'object' ? JSON.stringify(msg, null, 2) : msg;
+                      };
 
-                      function log(data) {
-                          logger.textContent = typeof data === "object" ? JSON.stringify(data, null, 2) : data;
-                      }
-
-                      async function loadWorkspace() {
+                      async function loadPaks() {
                           try {
-                              const res = await fetch("/api/status");
+                              const res = await fetch("/api/original/paks");
                               const data = await res.json();
-                              renderStats(data.folders);
-
-                              const ws = await fetch("/api/workspace");
-                              log(await ws.json());
-                          } catch (err) {
-                              log("Connection error: " + err);
-                          }
-                      }
-
-                      function renderStats(folders) {
-                          statsGrid.innerHTML = "";
-                          for (const [name, info] of Object.entries(folders)) {
-                              statsGrid.innerHTML += `
-                                  <div class="card">
-                                      <h3>${name}</h3>
-                                      <div class="metric">${info.count} <span style="font-size:14px;color:#8b949e">files</span></div>
-                                      <div style="font-size:12px;color:#8b949e;margin-top:4px">${info.size_formatted}</div>
-                                  </div>
-                              `;
-                          }
-                      }
-
-                      async function uploadAsset() {
-                          const picker = document.getElementById("filePicker");
-                          const folder = document.getElementById("targetFolder").value;
-                          if (!picker.files.length) {
-                              alert("Select a file first.");
-                              return;
-                          }
-                          const form = new FormData();
-                          form.append("file", picker.files[0]);
-
-                          log("Uploading to " + folder + "...");
-                          try {
-                              const res = await fetch(`/api/upload?folder=${folder}`, {
-                                  method: "POST",
-                                  body: form
+                              const sel = document.getElementById("pakSelect");
+                              sel.innerHTML = "";
+                              if (!data.files.length) {
+                                  sel.innerHTML = '<option value="">No .pak files found in Original/</option>';
+                                  return;
+                              }
+                              data.files.forEach(f => {
+                                  const opt = document.createElement("option");
+                                  opt.value = f;
+                                  opt.textContent = f;
+                                  sel.appendChild(opt);
                               });
-                              log(await res.json());
-                              picker.value = "";
-                              loadWorkspace();
-                          } catch (err) {
-                              log("Upload Failed: " + err);
+                          } catch (e) { log("Error loading paks: " + e); }
+                      }
+
+                      async function uploadFile() {
+                          const input = document.getElementById("pakUploader");
+                          if (!input.files.length) return;
+                          const form = new FormData();
+                          form.append("file", input.files[0]);
+                          log("Uploading " + input.files[0].name + "...");
+                          const res = await fetch("/api/upload", { method: "POST", body: form });
+                          log(await res.json());
+                          loadPaks();
+                      }
+
+                      async function unpackSelected() {
+                          const filename = document.getElementById("pakSelect").value;
+                          if (!filename) { alert("Please choose a pak file!"); return; }
+                          log("Unpacking " + filename + "...");
+                          const res = await fetch("/api/pak/unpack", {
+                              method: "POST",
+                              headers: {"Content-Type": "application/json"},
+                              body: JSON.stringify({ filename })
+                          });
+                          const data = await res.json();
+                          log(data);
+                          renderProperties(data.editable_config.variables);
+                      }
+
+                      function renderProperties(vars) {
+                          const cont = document.getElementById("propContainer");
+                          cont.innerHTML = "";
+                          for (const [key, val] of Object.entries(vars)) {
+                              const row = document.createElement("div");
+                              row.className = "prop-row";
+                              row.innerHTML = `
+                                  <span class="prop-label">${key}</span>
+                                  <input class="prop-input" data-key="${key}" value="${val}">
+                              `;
+                              cont.appendChild(row);
                           }
                       }
 
-                      async function clearWorkspace() {
-                          const folder = document.getElementById("targetFolder").value;
-                          if (!confirm(`Are you sure you want to clean ${folder}?`)) return;
-                          const res = await fetch(`/api/workspace/clear?folder=${folder}`, { method: "POST" });
-                          log(await res.json());
-                          loadWorkspace();
+                      async function repackFile() {
+                          const inputs = document.querySelectorAll(".prop-input");
+                          if (!inputs.length) { alert("No values to repack. Unpack a pak first!"); return; }
+                          
+                          const newVars = {};
+                          inputs.forEach(i => {
+                              let val = i.value;
+                              if (val.toLowerCase() === "true") val = true;
+                              else if (val.toLowerCase() === "false") val = false;
+                              else if (!isNaN(val) && val.trim() !== "") val = Number(val);
+                              newVars[i.dataset.key] = val;
+                          });
+
+                          log("Saving modified values...");
+                          await fetch("/api/editor/update", {
+                              method: "POST",
+                              headers: {"Content-Type": "application/json"},
+                              body: JSON.stringify({ variables: newVars })
+                          });
+
+                          log("Repacking archive...");
+                          const outName = document.getElementById("outputName").value;
+                          const res = await fetch("/api/pak/repack", {
+                              method: "POST",
+                              headers: {"Content-Type": "application/json"},
+                              body: JSON.stringify({ output_name: outName || null })
+                          });
+                          const data = await res.json();
+                          log(data);
+
+                          if (data.download_url) {
+                              const btn = document.getElementById("downloadArea");
+                              const link = document.getElementById("downloadLink");
+                              link.href = data.download_url;
+                              link.download = data.filename;
+                              btn.style.display = "block";
+                          }
                       }
 
-                      loadWorkspace();
+                      loadPaks();
                   </script>
               </body>
               </html>
@@ -564,15 +535,15 @@ jobs:
           PY
 
       # --------------------------------------------------
-      # WORKSPACE INITIAL FILES
+      # DEFAULT WORKSPACE ASSETS
       # --------------------------------------------------
       - name: Create workspace files
         shell: bash
         run: |
-          printf '%s\n' "Directory for original uploaded pak assets." > server/workspace/Original/README.txt
-          printf '%s\n' "Directory for extracted assets." > server/workspace/Unpack/README.txt
-          printf '%s\n' "Staging area for modifications." > server/workspace/Editor/README.txt
-          printf '%s\n' "Ready-to-deliver repacked assets." > server/workspace/Repack/README.txt
+          printf '%s\n' "Place input .pak assets here." > server/workspace/Original/README.txt
+          printf '%s\n' "Extracted content directory." > server/workspace/Unpack/README.txt
+          printf '%s\n' "Editable parameters and staged items." > server/workspace/Editor/README.txt
+          printf '%s\n' "Compiled output pak binaries." > server/workspace/Repack/README.txt
 
       # --------------------------------------------------
       # DOCKERFILE
@@ -606,7 +577,7 @@ jobs:
           EOF
 
       # --------------------------------------------------
-      # RENDER DEPLOY CONFIG
+      # RENDER SPECIFICATION
       # --------------------------------------------------
       - name: Create render.yaml
         shell: bash
@@ -626,20 +597,16 @@ jobs:
           EOF
 
       # --------------------------------------------------
-      # PYTHON TEST & VALIDATION
+      # LOCAL TEST & ROUTE VALIDATION
       # --------------------------------------------------
-      - name: Install Python dependencies
+      - name: Install and test dependencies
         shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install -r server/requirements.txt
-
-      - name: Compile Python files
-        shell: bash
-        run: |
           python -m compileall -q server
 
-      - name: Test FastAPI application endpoints
+      - name: Route integrity check
         shell: bash
         run: |
           python - <<'PY'
@@ -648,32 +615,28 @@ jobs:
           from main import app
 
           actual_routes = {route.path for route in app.routes}
-
-          expected_endpoints = {
+          expected = {
               "/",
               "/pak",
               "/api/health",
-              "/api/status",
-              "/api/workspace",
-              "/api/files/{folder}",
-              "/api/upload",
+              "/api/original/paks",
+              "/api/pak/unpack",
+              "/api/editor/values",
+              "/api/editor/update",
+              "/api/pak/repack",
               "/api/download/{folder}/{filename:path}",
-              "/api/files/{folder}/{filename:path}",
-              "/api/workspace/clear",
-              "/api/process/unpack",
-              "/api/process/repack"
+              "/api/upload",
           }
 
-          missing = expected_endpoints - actual_routes
+          missing = expected - actual_routes
           if missing:
-              print(f"Error: Missing routes: {missing}")
+              print(f"Missing essential routes: {missing}")
               sys.exit(1)
-
-          print("All critical App & Web API routes verified successfully!")
+          print("All critical App & Web endpoints verified!")
           PY
 
       # --------------------------------------------------
-      # DOCKER BUILD VALIDATION
+      # BUILD DOCKER CONTAINER
       # --------------------------------------------------
       - name: Build Docker image
         shell: bash
@@ -681,22 +644,21 @@ jobs:
           docker build --tag pak-server:${GITHUB_SHA} .
 
       # --------------------------------------------------
-      # COMMIT AND PUSH
+      # PUSH GENERATED CODE
       # --------------------------------------------------
       - name: Commit and push generated files
         shell: bash
         run: |
           set -e
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add server/ Dockerfile render.yaml
 
           if git diff --cached --quiet; then
-            echo "No changes to commit."
+            echo "No changes."
             exit 0
           fi
 
-          git commit -m "feat: upgrade server with app-ready endpoints and secure workspace pipeline"
+          git commit -m "feat: complete automated unpack, patch editor and repack engine"
           git push origin HEAD:main
