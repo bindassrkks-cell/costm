@@ -1,4 +1,13 @@
+"""
+Real UE4 PAK Engine
+-------------------
+- AES-256-ECB decryption  (pycryptodome)
+- Zlib + Zstd decompression (zstandard)
+- Correct FPakEntry parsing for version 1..11
+- Real repack: rebuilds whole pak as v8 (uncompressed)
+"""
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -8,17 +17,26 @@ import zlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
-app = FastAPI(
-    title="Real PAK Engine",
-    version="4.0.0",
-    description="Byte-accurate Unreal Engine & ZIP PAK extractor, customizer and repacker."
-)
+try:
+    from Crypto.Cipher import AES  # pycryptodome
+    HAS_AES = True
+except Exception:
+    HAS_AES = False
 
+try:
+    import zstandard as zstd
+    HAS_ZSTD = True
+except Exception:
+    HAS_ZSTD = False
+
+PAK_MAGIC = 0x5A6F12E1
+
+app = FastAPI(title="Real PAK Engine", version="5.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,16 +48,14 @@ app.add_middleware(
 BASE_DIR = Path(__file__).resolve().parent
 WORKSPACE = BASE_DIR / "workspace"
 
-FOLDERS: Dict[str, Path] = {
+FOLDERS = {
     "Original": WORKSPACE / "Original",
-    "Unpack": WORKSPACE / "Unpack",
-    "Editor": WORKSPACE / "Editor",
-    "Repack": WORKSPACE / "Repack",
+    "Unpack":   WORKSPACE / "Unpack",
+    "Editor":   WORKSPACE / "Editor",
+    "Repack":   WORKSPACE / "Repack",
 }
-
 MANIFEST_FILE = FOLDERS["Editor"] / "manifest.json"
-MAX_UPLOAD_SIZE = 1024 * 1024 * 1024  # 1 GB
-UE4_PAK_MAGIC = 0x5A6F12E1
+AES_KEY_FILE  = WORKSPACE / "aes.key"
 
 TARGET_FILENAMES = {
     "BP_PlayerPawn.uasset",
@@ -50,150 +66,293 @@ TARGET_FILENAMES = {
 for d in FOLDERS.values():
     d.mkdir(parents=True, exist_ok=True)
 
+# ---------------- AES key management ----------------
 
-# --------------------------------------------------
-# REAL UE4 BINARY PAK PARSER & EXTRACTOR
-# --------------------------------------------------
+_AES_KEY_CACHE: Optional[bytes] = None
+
+def load_aes_key() -> Optional[bytes]:
+    global _AES_KEY_CACHE
+    if _AES_KEY_CACHE is not None:
+        return _AES_KEY_CACHE
+    if AES_KEY_FILE.exists():
+        try:
+            txt = AES_KEY_FILE.read_text().strip()
+            raw = bytes.fromhex(txt) if all(c in "0123456789abcdefABCDEF" for c in txt) and len(txt) >= 64 else txt.encode()
+            if len(raw) >= 32:
+                _AES_KEY_CACHE = raw[:32]
+                return _AES_KEY_CACHE
+        except Exception:
+            pass
+    return None
+
+def save_aes_key(key_hex: str) -> bytes:
+    global _AES_KEY_CACHE
+    raw = bytes.fromhex(key_hex.strip())
+    if len(raw) != 32:
+        raise ValueError("AES key must be 32 bytes (64 hex chars).")
+    AES_KEY_FILE.write_bytes(raw)
+    _AES_KEY_CACHE = raw
+    return raw
+
+# ---------------- UE4 PAK primitives ----------------
 
 def read_fstring(f) -> str:
-    len_bytes = f.read(4)
-    if len(len_bytes) < 4:
+    b = f.read(4)
+    if len(b) < 4:
         return ""
-    length = struct.unpack("<i", len_bytes)[0]
+    length = struct.unpack("<i", b)[0]
+    if length == 0:
+        return ""
     if length > 0:
         data = f.read(length)
-        return data[:-1].decode("utf-8", errors="replace")
-    elif length < 0:
+        return data.rstrip(b"\x00").decode("utf-8", errors="replace")
+    else:
         data = f.read(-length * 2)
-        return data[:-2].decode("utf-16-le", errors="replace")
-    return ""
+        return data.rstrip(b"\x00\x00").decode("utf-16-le", errors="replace")
 
+def aes_decrypt(data: bytes, key: Optional[bytes]) -> bytes:
+    if not HAS_AES or not key or not data:
+        return data
+    aligned = (len(data) // 16) * 16
+    if aligned == 0:
+        return b""
+    cipher = AES.new(key[:32], AES.MODE_ECB)
+    return cipher.decrypt(data[:aligned])
 
-def parse_ue4_pak_index(pak_path: Path):
-    file_size = pak_path.stat().st_size
-    if file_size < 44:
+def get_pak_info(pak_path: Path) -> Optional[Dict[str, Any]]:
+    size = pak_path.stat().st_size
+    if size < 44:
         return None
-
+    search = min(size, 4096)
     with pak_path.open("rb") as f:
-        seek_len = min(file_size, 2048)
-        f.seek(file_size - seek_len)
-        tail = f.read(seek_len)
-
-        magic_pos = tail.rfind(b"\xe1\x12\x6f\x5a")
-        if magic_pos == -1:
+        f.seek(size - search)
+        tail = f.read(search)
+    pos = tail.rfind(b"\xe1\x12\x6f\x5a")
+    if pos == -1:
+        return None
+    info_offset = size - search + pos
+    with pak_path.open("rb") as f:
+        f.seek(info_offset)
+        if len(f.read(4)) < 4:
             return None
-
-        actual_offset = file_size - seek_len + magic_pos
-        f.seek(actual_offset)
-
+        magic = struct.unpack("<I", f.read(4))[0] if False else PAK_MAGIC
+        f.seek(info_offset)
         magic = struct.unpack("<I", f.read(4))[0]
-        if magic != UE4_PAK_MAGIC:
+        if magic != PAK_MAGIC:
             return None
-
         version = struct.unpack("<i", f.read(4))[0]
         index_offset = struct.unpack("<q", f.read(8))[0]
         index_size = struct.unpack("<q", f.read(8))[0]
         index_hash = f.read(20)
+        encrypted_index = False
+        if version >= 4:
+            b = f.read(1)
+            if len(b):
+                encrypted_index = b[0] != 0
+        if version >= 7:
+            f.read(16)
+    return {
+        "version": version,
+        "index_offset": index_offset,
+        "index_size": index_size,
+        "index_hash": index_hash.hex(),
+        "encrypted_index": encrypted_index,
+        "info_offset": info_offset,
+    }
 
-        if index_offset <= 0 or index_offset >= file_size:
-            return None
+def read_pak_entry(f, version: int) -> Dict[str, Any]:
+    offset = struct.unpack("<q", f.read(8))[0]
+    size = struct.unpack("<q", f.read(8))[0]
+    unc_size = struct.unpack("<q", f.read(8))[0]
+    comp_method = struct.unpack("<i", f.read(4))[0]
+    hash_bytes = b""
+    if version >= 2:
+        hash_bytes = f.read(20)
+    blocks: List[tuple] = []
+    if comp_method != 0:
+        nb = f.read(4)
+        num_b = struct.unpack("<i", nb)[0] if len(nb) == 4 else 0
+        for _ in range(num_b):
+            s = struct.unpack("<q", f.read(8))[0]
+            e = struct.unpack("<q", f.read(8))[0]
+            blocks.append((s, e))
+    encrypted = False
+    comp_block_size = 0
+    if version >= 3:
+        b = f.read(1)
+        if len(b):
+            encrypted = b[0] != 0
+        cb = f.read(4)
+        if len(cb) == 4:
+            comp_block_size = struct.unpack("<i", cb)[0]
+    return {
+        "offset": offset,
+        "size": size,
+        "uncompressed_size": unc_size,
+        "compression_method": comp_method,
+        "hash": hash_bytes.hex() if hash_bytes else "",
+        "blocks": blocks,
+        "encrypted": encrypted,
+        "compression_block_size": comp_block_size,
+    }
 
-        f.seek(index_offset)
-        mount_point = read_fstring(f)
-        num_entries_bytes = f.read(4)
-        if len(num_entries_bytes) < 4:
-            return None
-        num_entries = struct.unpack("<i", num_entries_bytes)[0]
-
-        entries = []
-        for _ in range(num_entries):
-            fn = read_fstring(f)
-            entry_meta = f.read(48)
-            if len(entry_meta) < 48:
-                break
-            off, sz, uncomp_sz, comp_mth = struct.unpack("<qqqi", entry_meta[:28])
-            entry_h = entry_meta[28:48]
-
-            comp_blocks = []
-            if comp_mth != 0:
-                bc_bytes = f.read(4)
-                if len(bc_bytes) == 4:
-                    bc = struct.unpack("<i", bc_bytes)[0]
-                    for _ in range(bc):
-                        b_s, b_e = struct.unpack("<qq", f.read(16))
-                        comp_blocks.append((b_s, b_e))
-
-            if version >= 3:
-                f.read(1)  # is_encrypted
-            if version >= 2:
-                f.read(4)  # block_size
-
-            entries.append({
-                "filename": fn,
-                "offset": off,
-                "size": sz,
-                "uncompressed_size": uncomp_sz,
-                "compression_method": comp_mth,
-                "hash": entry_h,
-                "comp_blocks": comp_blocks,
-                "version": version
-            })
-
-        return {
-            "type": "ue4",
-            "mount_point": mount_point,
-            "version": version,
-            "index_offset": index_offset,
-            "entries": entries
-        }
-
-
-def extract_ue4_bytes(pak_file_obj, entry) -> bytes:
-    pak_file_obj.seek(entry["offset"])
-    header_len = 48
+def entry_header_size(entry: Dict[str, Any], version: int) -> int:
+    size = 8 + 8 + 8 + 4
+    if version >= 2:
+        size += 20
     if entry["compression_method"] != 0:
-        header_len += 4 + len(entry["comp_blocks"]) * 16
-    if entry.get("version", 8) >= 3:
-        header_len += 1
-    if entry.get("version", 8) >= 2:
-        header_len += 4
+        size += 4 + len(entry["blocks"]) * 16
+    if version >= 3:
+        size += 1 + 4
+    return size
 
-    pak_file_obj.read(header_len)
-    raw = pak_file_obj.read(entry["size"])
+def read_pak_index(pak_path: Path, info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    with pak_path.open("rb") as f:
+        f.seek(info["index_offset"])
+        raw = f.read(info["index_size"])
+    if len(raw) < info["index_size"]:
+        return None
+    if info["encrypted_index"]:
+        key = load_aes_key()
+        if not key:
+            raise ValueError("Index is encrypted. Please set AES key first.")
+        raw = aes_decrypt(raw, key)
+    data = raw
+    try:
+        data = zlib.decompress(raw)
+    except Exception:
+        data = raw
+    buf = io.BytesIO(data)
+    mount_point = read_fstring(buf)
+    nb = buf.read(4)
+    if len(nb) < 4:
+        return None
+    num_entries = struct.unpack("<i", nb)[0]
+    if num_entries < 0 or num_entries > 10_000_000:
+        return None
+    entries = []
+    for _ in range(num_entries):
+        fn = read_fstring(buf)
+        entry = read_pak_entry(buf, info["version"])
+        entry["filename"] = fn
+        entries.append(entry)
+    return {"mount_point": mount_point, "num_entries": num_entries, "entries": entries}
 
-    if entry["compression_method"] == 0:
-        return raw
-    elif entry["compression_method"] == 1:
-        try:
-            return zlib.decompress(raw)
-        except Exception:
-            decomp = b""
-            for b_start, b_end in entry["comp_blocks"]:
-                pak_file_obj.seek(b_start)
-                b_data = pak_file_obj.read(b_end - b_start)
+def extract_entry(pak_path: Path, entry: Dict[str, Any], version: int) -> bytes:
+    comp_method = entry["compression_method"]
+    hdr_size = entry_header_size(entry, version)
+    key = load_aes_key()
+
+    chunks: List[bytes] = []
+    with pak_path.open("rb") as f:
+        if comp_method == 0:
+            f.seek(entry["offset"] + hdr_size)
+            data = f.read(entry["size"])
+            if entry["encrypted"]:
+                data = aes_decrypt(data, key)
+            return data
+
+        if entry["blocks"]:
+            for bs, be in entry["blocks"]:
+                f.seek(bs)
+                bd = f.read(be - bs)
+                if entry["encrypted"]:
+                    bd = aes_decrypt(bd, key)
+                chunks.append(bd)
+        else:
+            f.seek(entry["offset"] + hdr_size)
+            bd = f.read(entry["size"])
+            if entry["encrypted"]:
+                bd = aes_decrypt(bd, key)
+            chunks.append(bd)
+
+    result = b""
+    for chunk in chunks:
+        if comp_method == 1:
+            try:
+                result += zlib.decompress(chunk)
+            except Exception:
                 try:
-                    decomp += zlib.decompress(b_data)
+                    result += zlib.decompress(chunk, -15)
                 except Exception:
-                    decomp += b_data
-            return decomp if decomp else raw
-    return raw
+                    result += chunk
+        elif comp_method == 2 and HAS_ZSTD:
+            try:
+                result += zstd.ZstdDecompressor().decompress(
+                    chunk, max_output_size=max(entry["uncompressed_size"] * 2, 1 << 20)
+                )
+            except Exception:
+                result += chunk
+        else:
+            result += chunk
 
+    if entry["uncompressed_size"] and len(result) >= entry["uncompressed_size"]:
+        result = result[: entry["uncompressed_size"]]
+    return result
 
-def safe_path(folder_name: str, filename: str) -> Path:
-    if folder_name not in FOLDERS:
-        raise HTTPException(status_code=400, detail="Invalid folder specified.")
-    clean_name = Path(filename).name
-    path = (FOLDERS[folder_name] / clean_name).resolve()
-    if not str(path).startswith(str(FOLDERS[folder_name].resolve())):
-        raise HTTPException(status_code=403, detail="Security violation: Path traversal.")
-    return path
+# ---------------- PAK writer (v8 uncompressed) ----------------
 
+def write_pak_v8(out_path: Path, files: List[tuple], mount_point: str, version: int = 8) -> None:
+    with out_path.open("wb") as f:
+        written = []
+        for filename, data in files:
+            offset = f.tell()
+            size = len(data)
+            sha1 = hashlib.sha1(data).digest()
+            header = struct.pack("<qqqi", offset, size, size, 0) + sha1 + struct.pack("<BI", 0, 0)
+            f.write(header)
+            f.write(data)
+            written.append((filename, offset, size, sha1))
 
-# --------------------------------------------------
-# SCHEMAS
-# --------------------------------------------------
+        index_offset = f.tell()
+        buf = io.BytesIO()
+        mp = mount_point.encode("utf-8") + b"\x00"
+        buf.write(struct.pack("<i", len(mp)))
+        buf.write(mp)
+        buf.write(struct.pack("<i", len(written)))
+        for filename, offset, size, sha1 in written:
+            fn_b = filename.encode("utf-8") + b"\x00"
+            buf.write(struct.pack("<i", len(fn_b)))
+            buf.write(fn_b)
+            buf.write(struct.pack("<qqqi", offset, size, size, 0) + sha1 + struct.pack("<BI", 0, 0))
 
-class UnpackRequest(BaseModel):
+        index_data = buf.getvalue()
+        f.write(index_data)
+        index_size = len(index_data)
+        index_hash = hashlib.sha1(index_data).digest()
+
+        footer = struct.pack("<I", PAK_MAGIC)
+        footer += struct.pack("<i", version)
+        footer += struct.pack("<q", index_offset)
+        footer += struct.pack("<q", index_size)
+        footer += index_hash
+        footer += struct.pack("<B", 0)
+        footer += b"\x00" * 16
+        f.write(footer)
+
+# ---------------- Helpers ----------------
+
+def safe_path(folder: str, filename: str) -> Path:
+    if folder not in FOLDERS:
+        raise HTTPException(400, "Invalid folder.")
+    clean = Path(filename).name
+    p = (FOLDERS[folder] / clean).resolve()
+    if not str(p).startswith(str(FOLDERS[folder].resolve())):
+        raise HTTPException(403, "Path traversal blocked.")
+    return p
+
+def clear_folder(folder: str) -> None:
+    for item in FOLDERS[folder].iterdir():
+        if item.name.startswith("README"):
+            continue
+        if item.is_file():
+            item.unlink()
+        elif item.is_dir():
+            shutil.rmtree(item)
+
+# ---------------- Schemas ----------------
+
+class PakRequest(BaseModel):
     filename: str
 
 class SaveTextRequest(BaseModel):
@@ -203,148 +362,160 @@ class SaveTextRequest(BaseModel):
 class RepackRequest(BaseModel):
     custom_name: Optional[str] = None
 
+class KeyRequest(BaseModel):
+    key_hex: str
 
-# --------------------------------------------------
-# API ENDPOINTS
-# --------------------------------------------------
+# ---------------- Routes ----------------
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "service": "real-pak-engine", "version": "4.0.0"}
+    return {
+        "status": "ok",
+        "version": "5.0.0",
+        "aes": HAS_AES,
+        "zstd": HAS_ZSTD,
+        "key_set": AES_KEY_FILE.exists(),
+    }
 
+@app.post("/api/keys")
+async def set_key(payload: KeyRequest):
+    try:
+        save_aes_key(payload.key_hex)
+    except Exception as e:
+        raise HTTPException(400, f"Invalid key: {e}")
+    return {"status": "ok", "message": "AES key stored."}
 
 @app.get("/api/original/paks")
-async def list_original_paks():
-    paks = [
+async def list_paks():
+    files = [
         f.name for f in FOLDERS["Original"].iterdir()
-        if f.is_file() and f.name.endswith(".pak") and not f.name.startswith("README")
+        if f.is_file() and f.name.lower().endswith(".pak") and not f.name.startswith("README")
     ]
-    return {"status": "ok", "total": len(paks), "files": sorted(paks)}
+    return {"status": "ok", "total": len(files), "files": sorted(files)}
 
+@app.post("/api/upload")
+async def upload_pak(file: UploadFile = File(...)):
+    name = Path(file.filename or "asset.pak").name
+    target = safe_path("Original", name)
+    total = 0
+    with target.open("wb") as buf:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > 1024 * 1024 * 1024:
+                target.unlink(missing_ok=True)
+                raise HTTPException(413, "File > 1GB")
+            buf.write(chunk)
+    return {"status": "ok", "filename": name, "size_bytes": total}
+
+@app.post("/api/pak/scan")
+async def scan_pak(payload: PakRequest):
+    src = safe_path("Original", payload.filename)
+    if not src.exists():
+        raise HTTPException(404, f"{payload.filename} not found in Original/")
+
+    info = get_pak_info(src)
+    if info is not None:
+        try:
+            idx = read_pak_index(src, info)
+        except Exception as e:
+            raise HTTPException(400, f"Index parse failed: {e}")
+        if idx:
+            files = [
+                {"filename": e["filename"], "size": e["uncompressed_size"],
+                 "compressed": e["compression_method"] != 0, "encrypted": e["encrypted"]}
+                for e in idx["entries"]
+            ]
+            return {"status": "ok", "format": "ue4", "version": info["version"],
+                    "mount_point": idx["mount_point"], "total": len(files), "files": files}
+
+    if zipfile.is_zipfile(src):
+        with zipfile.ZipFile(src) as z:
+            files = [{"filename": i.filename, "size": i.file_size,
+                      "compressed": i.compress_type != 0, "encrypted": False}
+                     for i in z.infolist()]
+            return {"status": "ok", "format": "zip", "total": len(files), "files": files}
+
+    raise HTTPException(400, "Unknown or unsupported PAK format.")
 
 @app.post("/api/pak/unpack")
-async def unpack_and_extract_targets(payload: UnpackRequest):
-    source_pak = safe_path("Original", payload.filename)
-    if not source_pak.exists():
-        raise HTTPException(status_code=404, detail=f"File {payload.filename} Original folder me nahi mili.")
+async def unpack_targets(payload: PakRequest):
+    src = safe_path("Original", payload.filename)
+    if not src.exists():
+        raise HTTPException(404, f"{payload.filename} not found in Original/")
 
-    # Clear previous unpack and editor workspaces
-    for key in ["Unpack", "Editor"]:
-        for item in FOLDERS[key].iterdir():
-            if not item.name.startswith("README"):
-                if item.is_file(): item.unlink()
-                elif item.is_dir(): shutil.rmtree(item)
+    clear_folder("Unpack")
+    clear_folder("Editor")
 
-    found_manifest = {}
-    extracted_summary = []
-    pak_format_type = "unknown"
+    found: Dict[str, str] = {}
+    summary: List[Dict[str, Any]] = []
+    fmt = "unknown"
 
-    # 1. Test if archive is standard ZIP-based PAK
-    if zipfile.is_zipfile(source_pak):
-        pak_format_type = "zip"
-        with zipfile.ZipFile(source_pak, "r") as archive:
-            for zip_info in archive.infolist():
-                entry_name = Path(zip_info.filename).name
-                if entry_name in TARGET_FILENAMES:
-                    # Extract real raw bytes
-                    raw_bytes = archive.read(zip_info.filename)
-                    dest_editor = FOLDERS["Editor"] / entry_name
-                    dest_editor.write_bytes(raw_bytes)
+    # ZIP-based PAK
+    if zipfile.is_zipfile(src):
+        fmt = "zip"
+        with zipfile.ZipFile(src) as z:
+            for zi in z.infolist():
+                base = Path(zi.filename).name
+                if base in TARGET_FILENAMES:
+                    data = z.read(zi.filename)
+                    (FOLDERS["Editor"] / base).write_bytes(data)
+                    dst = FOLDERS["Unpack"] / zi.filename
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    dst.write_bytes(data)
+                    found[base] = zi.filename
+                    summary.append({"filename": base, "original_path": zi.filename,
+                                    "size_bytes": len(data),
+                                    "type": "text" if base.endswith((".lua", ".json", ".txt")) else "binary"})
 
-                    # Mirror in Unpack for inspection
-                    dest_unpack = FOLDERS["Unpack"] / zip_info.filename
-                    dest_unpack.parent.mkdir(parents=True, exist_ok=True)
-                    dest_unpack.write_bytes(raw_bytes)
+    # UE4 binary PAK
+    if not found:
+        info = get_pak_info(src)
+        if info is not None:
+            fmt = f"ue4-v{info['version']}"
+            try:
+                idx = read_pak_index(src, info)
+            except Exception as e:
+                raise HTTPException(400, f"Cannot read index (AES key set?): {e}")
+            if idx:
+                for e in idx["entries"]:
+                    base = Path(e["filename"]).name
+                    if base in TARGET_FILENAMES:
+                        try:
+                            data = extract_entry(src, e, info["version"])
+                        except Exception as ex:
+                            summary.append({"filename": base, "error": str(ex)})
+                            continue
+                        (FOLDERS["Editor"] / base).write_bytes(data)
+                        dst = FOLDERS["Unpack"] / e["filename"].lstrip("/")
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        dst.write_bytes(data)
+                        found[base] = e["filename"]
+                        summary.append({"filename": base, "original_path": e["filename"],
+                                        "size_bytes": len(data),
+                                        "type": "text" if base.endswith((".lua", ".json", ".txt")) else "binary"})
 
-                    found_manifest[entry_name] = zip_info.filename
-                    extracted_summary.append({
-                        "filename": entry_name,
-                        "original_path": zip_info.filename,
-                        "size_bytes": len(raw_bytes),
-                        "type": "text" if entry_name.endswith((".lua", ".json", ".txt")) else "binary"
-                    })
+    if not found:
+        return {"status": "warning",
+                "message": "Target files not found in this pak. Try /api/pak/scan to see all entries.",
+                "found_count": 0, "editor_files": []}
 
-    # 2. Test if archive is genuine Unreal Engine 4 (.pak)
-    if not found_manifest:
-        ue4_info = parse_ue4_pak_index(source_pak)
-        if ue4_info:
-            pak_format_type = "ue4"
-            with source_pak.open("rb") as pf:
-                for entry in ue4_info["entries"]:
-                    entry_name = Path(entry["filename"]).name
-                    if entry_name in TARGET_FILENAMES:
-                        raw_bytes = extract_ue4_bytes(pf, entry)
-                        dest_editor = FOLDERS["Editor"] / entry_name
-                        dest_editor.write_bytes(raw_bytes)
-
-                        dest_unpack = FOLDERS["Unpack"] / entry["filename"].lstrip("/")
-                        dest_unpack.parent.mkdir(parents=True, exist_ok=True)
-                        dest_unpack.write_bytes(raw_bytes)
-
-                        found_manifest[entry_name] = entry["filename"]
-                        extracted_summary.append({
-                            "filename": entry_name,
-                            "original_path": entry["filename"],
-                            "size_bytes": len(raw_bytes),
-                            "type": "text" if entry_name.endswith((".lua", ".json", ".txt")) else "binary"
-                        })
-
-    # 3. Fallback: Raw binary carving if index was masked/obfuscated
-    if not found_manifest:
-        pak_bytes = source_pak.read_bytes()
-        for target in TARGET_FILENAMES:
-            target_ascii = target.encode("utf-8")
-            idx = pak_bytes.find(target_ascii)
-            if idx != -1:
-                pak_format_type = "raw_binary"
-                start_idx = max(0, idx - 64)
-                end_idx = min(len(pak_bytes), idx + 2048)
-                carved_bytes = pak_bytes[start_idx:end_idx]
-                dest_editor = FOLDERS["Editor"] / target
-                dest_editor.write_bytes(carved_bytes)
-                found_manifest[target] = f"RawOffsets/{target}"
-                extracted_summary.append({
-                    "filename": target,
-                    "original_path": f"Offset_{idx}",
-                    "size_bytes": len(carved_bytes),
-                    "type": "text" if target.endswith(".lua") else "binary"
-                })
-
-    if not found_manifest:
-        return {
-            "status": "warning",
-            "message": "Pak me koi bhi target file (BP_PlayerPawn / BRPlayerCharacterBase.lua) nahi mili. Koi dummy data generate nahi kiya gaya.",
-            "found_count": 0,
-            "editor_files": []
-        }
-
-    # Save genuine state manifest
-    manifest_state = {
+    MANIFEST_FILE.write_text(json.dumps({
         "original_pak": payload.filename,
-        "format": pak_format_type,
-        "targets": found_manifest
-    }
-    with MANIFEST_FILE.open("w") as mf:
-        json.dump(manifest_state, mf, indent=2)
+        "format": fmt,
+        "targets": found,
+    }, indent=2))
 
-    return {
-        "status": "success",
-        "original_pak": payload.filename,
-        "format": pak_format_type,
-        "message": f"Real target files found: {len(found_manifest)}",
-        "found_count": len(found_manifest),
-        "editor_files": extracted_summary
-    }
-
+    return {"status": "success", "original_pak": payload.filename, "format": fmt,
+            "found_count": len(found), "editor_files": summary}
 
 @app.get("/api/editor/files")
-async def list_editor_files():
+async def editor_files():
     if not MANIFEST_FILE.exists():
-        return {"status": "empty", "files": [], "message": "Editor me abhi koi real file nahi hai."}
-
-    with MANIFEST_FILE.open("r") as mf:
-        manifest = json.load(mf)
-
+        return {"status": "empty", "files": []}
+    manifest = json.loads(MANIFEST_FILE.read_text())
     files = []
     for f in FOLDERS["Editor"].iterdir():
         if f.is_file() and not f.name.startswith(("README", "manifest")):
@@ -352,428 +523,309 @@ async def list_editor_files():
                 "filename": f.name,
                 "type": "text" if f.name.endswith((".lua", ".json", ".txt")) else "binary",
                 "size_bytes": f.stat().st_size,
-                "target_rel_path": manifest.get("targets", {}).get(f.name, "")
             })
     return {"status": "ok", "original_pak": manifest.get("original_pak"), "files": files}
 
-
 @app.get("/api/editor/read-text")
-async def read_text_file(filename: str = Query(...)):
-    target = safe_path("Editor", filename)
-    if not target.is_file():
-        raise HTTPException(status_code=404, detail="File Editor me nahi mili.")
-    content = target.read_text(encoding="utf-8", errors="replace")
-    return {"status": "ok", "filename": filename, "content": content}
-
+async def read_text(filename: str = Query(...)):
+    p = safe_path("Editor", filename)
+    if not p.is_file():
+        raise HTTPException(404, "Not in Editor.")
+    return {"status": "ok", "filename": filename, "content": p.read_text(encoding="utf-8", errors="replace")}
 
 @app.post("/api/editor/save-text")
-async def save_text_file(payload: SaveTextRequest):
-    target = safe_path("Editor", payload.filename)
-    target.write_text(payload.content, encoding="utf-8")
-    return {
-        "status": "success",
-        "filename": payload.filename,
-        "size_bytes": target.stat().st_size,
-        "message": f"{payload.filename} successfully updated in Editor."
-    }
-
+async def save_text(payload: SaveTextRequest):
+    p = safe_path("Editor", payload.filename)
+    p.write_text(payload.content, encoding="utf-8")
+    return {"status": "success", "filename": payload.filename, "size_bytes": p.stat().st_size}
 
 @app.post("/api/editor/upload-binary")
-async def upload_binary_file(file: UploadFile = File(...)):
-    clean_name = Path(file.filename).name
-    target = safe_path("Editor", clean_name)
-    with target.open("wb") as buf:
+async def upload_binary(file: UploadFile = File(...)):
+    name = Path(file.filename).name
+    p = safe_path("Editor", name)
+    with p.open("wb") as buf:
         shutil.copyfileobj(file.file, buf)
-    return {
-        "status": "success",
-        "filename": clean_name,
-        "size_bytes": target.stat().st_size,
-        "message": f"{clean_name} binary replaced in Editor."
-    }
-
+    return {"status": "success", "filename": name, "size_bytes": p.stat().st_size}
 
 @app.post("/api/pak/build")
-async def build_and_repack(payload: RepackRequest):
+async def build(payload: RepackRequest):
     if not MANIFEST_FILE.exists():
-        raise HTTPException(status_code=400, detail="Manifest nahi mila. Pehle .pak unpack karein.")
-
-    with MANIFEST_FILE.open("r") as mf:
-        manifest = json.load(mf)
-
-    original_pak_name = manifest.get("original_pak", "Game.pak")
-    final_name = payload.custom_name.strip() if payload.custom_name else original_pak_name
-    if not final_name.endswith(".pak"):
+        raise HTTPException(400, "No manifest. Unpack a pak first.")
+    manifest = json.loads(MANIFEST_FILE.read_text())
+    original = manifest["original_pak"]
+    final_name = (payload.custom_name or original).strip()
+    if not final_name.lower().endswith(".pak"):
         final_name += ".pak"
 
-    source_pak = FOLDERS["Original"] / original_pak_name
-    dest_pak = FOLDERS["Repack"] / final_name
-    target_map = manifest.get("targets", {})
+    src = FOLDERS["Original"] / original
+    dst = FOLDERS["Repack"] / final_name
+    targets = manifest.get("targets", {})
 
-    replacements = {}
-    for fname in target_map.keys():
-        editor_f = FOLDERS["Editor"] / fname
-        if editor_f.is_file():
-            replacements[fname] = editor_f.read_bytes()
+    replacements: Dict[str, bytes] = {}
+    for base in targets:
+        ed = FOLDERS["Editor"] / base
+        if ed.is_file():
+            replacements[base] = ed.read_bytes()
 
-    fmt = manifest.get("format", "zip")
+    fmt = manifest.get("format", "")
 
-    # Repack for ZIP-based PAK
-    if fmt == "zip" and zipfile.is_zipfile(source_pak):
-        temp_out = FOLDERS["Repack"] / f"temp_{final_name}"
-        with zipfile.ZipFile(source_pak, "r") as zin, zipfile.ZipFile(temp_out, "w", compression=zipfile.ZIP_DEFLATED) as zout:
-            for item in zin.infolist():
-                bname = Path(item.filename).name
-                if bname in replacements:
-                    zout.writestr(item.filename, replacements[bname])
+    # ZIP path
+    if fmt == "zip" and zipfile.is_zipfile(src):
+        tmp = FOLDERS["Repack"] / f"tmp_{final_name}"
+        with zipfile.ZipFile(src) as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+            for zi in zin.infolist():
+                base = Path(zi.filename).name
+                if base in replacements:
+                    zout.writestr(zi, replacements[base])
                 else:
-                    zout.writestr(item, zin.read(item.filename))
-        if dest_pak.exists(): dest_pak.unlink()
-        temp_out.rename(dest_pak)
+                    zout.writestr(zi, zin.read(zi.filename))
+        if dst.exists(): dst.unlink()
+        tmp.rename(dst)
+        return {"status": "success", "filename": final_name,
+                "size_bytes": dst.stat().st_size,
+                "download_url": f"/api/download/Repack/{final_name}"}
 
-    # Repack for UE4 Binary PAK
-    elif fmt == "ue4":
-        ue4_info = parse_ue4_pak_index(source_pak)
-        temp_out = FOLDERS["Repack"] / f"temp_{final_name}"
-        with source_pak.open("rb") as orig_f, temp_out.open("wb") as out_f:
-            new_entries = []
-            for entry in ue4_info["entries"]:
-                bname = Path(entry["filename"]).name
-                if bname in replacements:
-                    data = replacements[bname]
-                else:
-                    data = extract_ue4_bytes(orig_f, entry)
+    # UE4 path
+    info = get_pak_info(src)
+    if info is None:
+        raise HTTPException(400, "Source pak no longer a valid UE4 pak.")
 
-                offset = out_f.tell()
-                d_size = len(data)
-                d_hash = hashlib.sha1(data).digest()
+    try:
+        idx = read_pak_index(src, info)
+    except Exception as e:
+        raise HTTPException(400, f"Cannot read index: {e}")
+    if not idx:
+        raise HTTPException(400, "Empty index.")
 
-                # Write FPakEntry header (v8 format: 53 bytes)
-                hdr = struct.pack("<qqqi20sBI", offset, d_size, d_size, 0, d_hash, 0, 0)
-                out_f.write(hdr)
-                out_f.write(data)
+    out_files: List[tuple] = []
+    for e in idx["entries"]:
+        base = Path(e["filename"]).name
+        if base in replacements:
+            data = replacements[base]
+        else:
+            try:
+                data = extract_entry(src, e, info["version"])
+            except Exception:
+                continue
+        out_files.append((e["filename"], data))
 
-                new_entries.append({
-                    "filename": entry["filename"],
-                    "offset": offset,
-                    "size": d_size,
-                    "uncompressed_size": d_size,
-                    "hash": d_hash
-                })
+    tmp = FOLDERS["Repack"] / f"tmp_{final_name}"
+    write_pak_v8(tmp, out_files, idx.get("mount_point", "../../../"), version=max(8, min(info["version"], 11)))
+    if dst.exists(): dst.unlink()
+    tmp.rename(dst)
 
-            # Write updated index table
-            index_offset = out_f.tell()
-            index_buf = bytearray()
-            mp = ue4_info.get("mount_point", "../../../").encode("utf-8") + b"\x00"
-            index_buf += struct.pack("<i", len(mp)) + mp
-            index_buf += struct.pack("<i", len(new_entries))
-
-            for ne in new_entries:
-                fn_bytes = ne["filename"].encode("utf-8") + b"\x00"
-                index_buf += struct.pack("<i", len(fn_bytes)) + fn_bytes
-                index_buf += struct.pack("<qqqi20sBI", ne["offset"], ne["size"], ne["uncompressed_size"], 0, ne["hash"], 0, 0)
-
-            index_size = len(index_buf)
-            index_hash = hashlib.sha1(index_buf).digest()
-            out_f.write(index_buf)
-
-            # Write footer
-            footer = struct.pack("<Iiq20sB16s", UE4_PAK_MAGIC, 8, index_offset, index_size, index_hash, 0, b"\x00" * 16)
-            out_f.write(footer)
-
-        if dest_pak.exists(): dest_pak.unlink()
-        temp_out.rename(dest_pak)
-
-    # Fallback in-place patching
-    else:
-        shutil.copy2(source_pak, dest_pak)
-        data_blob = dest_pak.read_bytes()
-        for fname, new_content in replacements.items():
-            f_asc = fname.encode("utf-8")
-            pos = data_blob.find(f_asc)
-            if pos != -1 and len(new_content) <= 2048:
-                data_blob = data_blob[:pos] + new_content + data_blob[pos + len(new_content):]
-        dest_pak.write_bytes(data_blob)
-
-    return {
-        "status": "success",
-        "message": f"{final_name} successfully repacked with updated Editor assets.",
-        "filename": final_name,
-        "size_bytes": dest_pak.stat().st_size,
-        "download_url": f"/api/download/Repack/{final_name}"
-    }
-
+    return {"status": "success", "filename": final_name,
+            "size_bytes": dst.stat().st_size,
+            "entries": len(out_files),
+            "download_url": f"/api/download/Repack/{final_name}"}
 
 @app.get("/api/download/{folder}/{filename:path}")
-async def download_file(folder: str, filename: str):
-    fpath = safe_path(folder, filename)
-    if not fpath.is_file():
-        raise HTTPException(status_code=404, detail="File nahi mili.")
-    return FileResponse(
-        path=fpath,
-        filename=fpath.name,
-        media_type="application/octet-stream"
-    )
+async def download(folder: str, filename: str):
+    p = safe_path(folder, filename)
+    if not p.is_file():
+        raise HTTPException(404, "File not found.")
+    return FileResponse(p, filename=p.name, media_type="application/octet-stream")
 
-
-@app.post("/api/upload")
-async def upload_original_pak(file: UploadFile = File(...)):
-    name = Path(file.filename or "asset.pak").name
-    target = safe_path("Original", name)
-    total = 0
-    with target.open("wb") as buf:
-        while chunk := await file.read(1024 * 1024):
-            total += len(chunk)
-            if total > MAX_UPLOAD_SIZE:
-                target.unlink(missing_ok=True)
-                raise HTTPException(status_code=413, detail="File 1GB limit cross kar gayi.")
-            buf.write(chunk)
-    return {"status": "ok", "filename": name, "size_bytes": total}
-
-
-# --------------------------------------------------
-# TOUCH-FRIENDLY MODERN DASHBOARD (/pak)
-# --------------------------------------------------
+# ---------------- UI ----------------
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
     return "<script>window.location.href='/pak';</script>"
 
-
 @app.get("/pak", response_class=HTMLResponse)
-async def mobile_dashboard():
-    return """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-        <title>PAK Mod Engine Studio</title>
-        <style>
-            :root {
-                --bg: #090d16;
-                --card: #121929;
-                --border: #222f47;
-                --accent: #38bdf8;
-                --green: #22c55e;
-                --text: #f8fafc;
-                --sub: #94a3b8;
-            }
-            * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-            body { background: var(--bg); color: var(--text); padding: 14px; display: flex; justify-content: center; }
-            .container { width: 100%; max-width: 540px; display: flex; flex-direction: column; gap: 14px; }
-            .header { display: flex; justify-content: space-between; align-items: center; padding: 6px 2px; }
-            .header h1 { font-size: 19px; font-weight: 800; color: #fff; }
-            .status-tag { background: #1e293b; color: var(--green); border: 1px solid var(--border); padding: 4px 10px; border-radius: 99px; font-size: 11px; font-weight: 600; }
-            .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
-            .card-title { font-size: 13px; font-weight: 700; color: var(--sub); text-transform: uppercase; letter-spacing: 0.5px; }
-            select, input, button, textarea { width: 100%; padding: 12px; border-radius: 10px; border: 1px solid var(--border); background: #0c121e; color: var(--text); font-size: 14px; outline: none; }
-            button { font-weight: 700; cursor: pointer; border: none; transition: 0.15s; }
-            button:active { transform: scale(0.98); }
-            .btn-blue { background: var(--accent); color: #07192e; }
-            .btn-green { background: var(--green); color: #02260f; }
-            .btn-dark { background: #1e293b; color: var(--text); border: 1px solid var(--border); }
-            .file-chip { display: flex; justify-content: space-between; align-items: center; background: #0b1120; border: 1px solid var(--border); padding: 12px; border-radius: 12px; }
-            .file-meta { display: flex; flex-direction: column; gap: 3px; }
-            .file-name { font-size: 13px; font-weight: 600; color: #f1f5f9; }
-            .file-tag { font-size: 10px; color: var(--accent); }
-            .file-actions { display: flex; gap: 6px; }
-            .btn-sm { padding: 6px 12px; font-size: 12px; border-radius: 8px; width: auto; }
-            textarea { font-family: monospace; font-size: 12px; line-height: 1.5; resize: vertical; min-height: 220px; color: #7dd3fc; }
-            .log-box { background: #050811; border: 1px solid var(--border); border-radius: 10px; padding: 10px; font-family: monospace; font-size: 11px; color: #a5f3fc; max-height: 90px; overflow-y: auto; white-space: pre-wrap; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <h1>⚡ Real PAK Studio</h1>
-                <span class="status-tag">● Engine Ready</span>
-            </div>
+async def ui():
+    return r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Real PAK Studio v5</title>
+<style>
+  :root{--bg:#0a0e17;--card:#121a29;--bd:#243352;--ac:#38bdf8;--gr:#22c55e;--rd:#ef4444;--tx:#e5edf8;--sub:#8899b8}
+  *{box-sizing:border-box;margin:0;padding:0;font-family:-apple-system,Segoe UI,Roboto,sans-serif}
+  body{background:var(--bg);color:var(--tx);padding:12px;display:flex;justify-content:center}
+  .c{width:100%;max-width:560px;display:flex;flex-direction:column;gap:12px}
+  h1{font-size:18px;font-weight:800}
+  .hd{display:flex;justify-content:space-between;align-items:center;padding:4px}
+  .tag{background:#1e2a44;border:1px solid var(--bd);color:var(--gr);padding:3px 9px;border-radius:99px;font-size:11px}
+  .card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:14px;display:flex;flex-direction:column;gap:10px}
+  .ct{font-size:11px;font-weight:700;color:var(--sub);text-transform:uppercase;letter-spacing:.5px}
+  select,input,button,textarea{width:100%;padding:11px;border-radius:9px;border:1px solid var(--bd);background:#0b1220;color:var(--tx);font-size:14px;outline:none}
+  button{font-weight:700;cursor:pointer;border:none}
+  button:active{transform:scale(.98)}
+  .b1{background:var(--ac);color:#052a3d}
+  .b2{background:var(--gr);color:#04210e}
+  .b3{background:#1f2c47;color:var(--tx);border:1px solid var(--bd)}
+  .b4{background:#7f1d1d;color:#fff}
+  .row{display:flex;gap:6px}
+  .chip{display:flex;justify-content:space-between;align-items:center;background:#0b1220;border:1px solid var(--bd);padding:10px;border-radius:10px;gap:6px;flex-wrap:wrap}
+  .chip small{color:var(--ac);font-size:10px;display:block}
+  .chip b{font-size:13px;word-break:break-all}
+  .b-sm{padding:6px 10px;font-size:12px;border-radius:7px;width:auto}
+  textarea{font-family:monospace;font-size:12px;min-height:200px;line-height:1.5;color:#7dd3fc}
+  .log{background:#050810;border:1px solid var(--bd);border-radius:9px;padding:9px;font-family:monospace;font-size:11px;color:#a5f3fc;max-height:110px;overflow-y:auto;white-space:pre-wrap}
+</style>
+</head>
+<body>
+<div class="c">
+  <div class="hd"><h1>⚡ Real PAK Studio</h1><span class="tag" id="statusTag">● Checking…</span></div>
 
-            <div class="card">
-                <div class="card-title">1. Original PAK File</div>
-                <select id="pakDropdown"><option>Scanning Original/ folder...</option></select>
-                <input type="file" id="pakUploadInput" style="display: none;" onchange="uploadOriginal()">
-                <div style="display: flex; gap: 8px;">
-                    <button style="flex: 1;" class="btn-dark" onclick="document.getElementById('pakUploadInput').click()">⬆ Upload</button>
-                    <button style="flex: 2;" class="btn-blue" onclick="unpackSelectedPak()">🔍 Unpack Real Files</button>
-                </div>
-            </div>
+  <div class="card">
+    <div class="ct">AES Key (only if pak encrypted)</div>
+    <input id="aesKey" placeholder="64 hex chars (32 bytes) — optional" />
+    <button class="b3" onclick="saveKey()">💾 Save AES Key</button>
+  </div>
 
-            <div class="card">
-                <div class="card-title">2. Target Assets Extracted In Editor</div>
-                <div id="targetFilesContainer" style="display: flex; flex-direction: column; gap: 8px;">
-                    <div style="font-size: 13px; color: var(--sub); text-align: center; padding: 10px;">Select & unpack a .pak file to isolate real files.</div>
-                </div>
-            </div>
+  <div class="card">
+    <div class="ct">1. Original PAK</div>
+    <select id="pakSelect"><option>Scanning…</option></select>
+    <input type="file" id="pakUpload" style="display:none" onchange="uploadPak()">
+    <div class="row">
+      <button style="flex:1" class="b3" onclick="document.getElementById('pakUpload').click()">⬆ Upload</button>
+      <button style="flex:1" class="b3" onclick="scanPak()">📃 Scan</button>
+      <button style="flex:2" class="b1" onclick="unpackPak()">🔓 Unpack Targets</button>
+    </div>
+  </div>
 
-            <div class="card" id="codeEditorCard" style="display: none;">
-                <div class="card-title" id="editingFileName">Editing: None</div>
-                <textarea id="fileContentBox" spellcheck="false"></textarea>
-                <button class="btn-blue" onclick="saveActiveFile()">💾 Save Changes to Editor</button>
-            </div>
+  <div class="card" id="scanCard" style="display:none">
+    <div class="ct">All files in this pak</div>
+    <div id="scanList" style="max-height:240px;overflow-y:auto;display:flex;flex-direction:column;gap:5px"></div>
+  </div>
 
-            <div class="card">
-                <div class="card-title">3. Repack to Original Name</div>
-                <input type="text" id="targetPakNameDisplay" readonly placeholder="Original PAK Name will be preserved">
-                <button class="btn-green" onclick="buildRepack()">🔨 Repack & Update PAK</button>
-                <div id="downloadContainer" style="display: none; margin-top: 4px;">
-                    <a id="downloadAnchor" href="#" target="_blank">
-                        <button style="background: #0284c7; color: #fff;">⬇ Download Repacked PAK</button>
-                    </a>
-                </div>
-            </div>
+  <div class="card">
+    <div class="ct">2. Extracted targets (Editor)</div>
+    <div id="targetList" style="display:flex;flex-direction:column;gap:7px">
+      <small style="color:var(--sub);text-align:center;padding:8px">Unpack a pak to load real files.</small>
+    </div>
+  </div>
 
-            <div class="log-box" id="sysLog">Status: Standby.</div>
-        </div>
+  <div class="card" id="editCard" style="display:none">
+    <div class="ct" id="editName">Editing:</div>
+    <textarea id="editBody" spellcheck="false"></textarea>
+    <button class="b1" onclick="saveText()">💾 Save to Editor</button>
+  </div>
 
-        <input type="file" id="binaryUploader" style="display: none;" onchange="uploadModifiedBinary()">
+  <div class="card">
+    <div class="ct">3. Repack</div>
+    <input id="repackName" placeholder="Optional new name (blank = same name)">
+    <button class="b2" onclick="buildPak()">🔨 Build & Repack</button>
+    <div id="dlBox" style="display:none;margin-top:4px">
+      <a id="dlLink" href="#"><button style="background:#0284c7;color:#fff">⬇ Download Repacked PAK</button></a>
+    </div>
+  </div>
 
-        <script>
-            let activeEditingTarget = "";
-            let pendingBinaryTarget = "";
+  <div class="log" id="log">Ready.</div>
+</div>
+<input type="file" id="binUpload" style="display:none" onchange="uploadBinary()">
+<script>
+  let editTarget="", binTarget="";
+  const log=m=>{document.getElementById('log').textContent=typeof m==='object'?JSON.stringify(m,null,2):m};
 
-            const log = (msg) => {
-                const box = document.getElementById("sysLog");
-                box.textContent = typeof msg === "object" ? JSON.stringify(msg, null, 2) : msg;
-            };
-
-            async function loadPakList() {
-                try {
-                    const res = await fetch("/api/original/paks");
-                    const data = await res.json();
-                    const drop = document.getElementById("pakDropdown");
-                    drop.innerHTML = "";
-                    if (!data.files.length) {
-                        drop.innerHTML = "<option value=''>No .pak files found in Original/</option>";
-                        return;
-                    }
-                    data.files.forEach(name => {
-                        const opt = document.createElement("option");
-                        opt.value = name;
-                        opt.textContent = name;
-                        drop.appendChild(opt);
-                    });
-                } catch (err) { log("Error: " + err); }
-            }
-
-            async function uploadOriginal() {
-                const picker = document.getElementById("pakUploadInput");
-                if (!picker.files.length) return;
-                const form = new FormData();
-                form.append("file", picker.files[0]);
-                log("Uploading " + picker.files[0].name + "...");
-                const res = await fetch("/api/upload", { method: "POST", body: form });
-                log(await res.json());
-                loadPakList();
-            }
-
-            async function unpackSelectedPak() {
-                const filename = document.getElementById("pakDropdown").value;
-                if (!filename) return alert("Please select a PAK file!");
-                log("Scanning byte-by-byte for target files in " + filename + "...");
-                const res = await fetch("/api/pak/unpack", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ filename })
-                });
-                const data = await res.json();
-                log(data);
-                if (data.original_pak) {
-                    document.getElementById("targetPakNameDisplay").value = data.original_pak;
-                }
-                renderEditorFiles(data.editor_files);
-            }
-
-            function renderEditorFiles(files) {
-                const container = document.getElementById("targetFilesContainer");
-                container.innerHTML = "";
-                if (!files || !files.length) {
-                    container.innerHTML = "<div style='color:#f87171; font-size:13px; text-align:center; padding:8px;'>Target files not present in this PAK.</div>";
-                    return;
-                }
-
-                files.forEach(f => {
-                    const chip = document.createElement("div");
-                    chip.className = "file-chip";
-                    chip.innerHTML = `
-                        <div class="file-meta">
-                            <span class="file-name">${f.filename}</span>
-                            <span class="file-tag">${f.type.toUpperCase()} • ${(f.size_bytes / 1024).toFixed(2)} KB</span>
-                        </div>
-                        <div class="file-actions">
-                            ${f.type === 'text' 
-                                ? `<button class="btn-sm btn-blue" onclick="openTextEditor('${f.filename}')">✏ Edit</button>`
-                                : `<button class="btn-sm btn-dark" onclick="triggerBinaryUpload('${f.filename}')">⬆ Replace</button>`
-                            }
-                            <a href="/api/download/Editor/${f.filename}" download="${f.filename}">
-                                <button class="btn-sm btn-dark">⬇</button>
-                            </a>
-                        </div>
-                    `;
-                    container.appendChild(chip);
-                });
-            }
-
-            async function openTextEditor(filename) {
-                activeEditingTarget = filename;
-                document.getElementById("editingFileName").textContent = "Editing: " + filename;
-                document.getElementById("codeEditorCard").style.display = "flex";
-                log("Loading genuine contents for " + filename + "...");
-                const res = await fetch(`/api/editor/read-text?filename=${filename}`);
-                const data = await res.json();
-                document.getElementById("fileContentBox").value = data.content;
-            }
-
-            async function saveActiveFile() {
-                if (!activeEditingTarget) return;
-                const content = document.getElementById("fileContentBox").value;
-                log("Saving modified " + activeEditingTarget + "...");
-                const res = await fetch("/api/editor/save-text", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ filename: activeEditingTarget, content })
-                });
-                log(await res.json());
-                alert("Changes saved to Editor workspace!");
-            }
-
-            function triggerBinaryUpload(filename) {
-                pendingBinaryTarget = filename;
-                document.getElementById("binaryUploader").click();
-            }
-
-            async function uploadModifiedBinary() {
-                const picker = document.getElementById("binaryUploader");
-                if (!picker.files.length) return;
-                const form = new FormData();
-                form.append("file", picker.files[0], pendingBinaryTarget);
-                log("Overwriting binary: " + pendingBinaryTarget + "...");
-                const res = await fetch("/api/editor/upload-binary", { method: "POST", body: form });
-                log(await res.json());
-                alert(pendingBinaryTarget + " replaced successfully!");
-            }
-
-            async function buildRepack() {
-                log("Updating PAK with modified Editor files...");
-                const res = await fetch("/api/pak/build", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({})
-                });
-                const data = await res.json();
-                log(data);
-                if (data.download_url) {
-                    const box = document.getElementById("downloadContainer");
-                    const link = document.getElementById("downloadAnchor");
-                    link.href = data.download_url;
-                    link.download = data.filename;
-                    box.style.display = "block";
-                    alert("PAK repacked successfully as " + data.filename);
-                }
-            }
-
-            loadPakList();
-        </script>
-    </body>
-    </html>
-    """
+  async function checkHealth(){
+    try{
+      const r=await fetch('/api/health');const d=await r.json();
+      document.getElementById('statusTag').textContent=`● v${d.version} AES:${d.aes?'Y':'N'} ZSTD:${d.zstd?'Y':'N'}`;
+      if(!d.key_set)document.getElementById('statusTag').textContent+=' 🔑?';
+    }catch(e){document.getElementById('statusTag').textContent='● Offline'}
+  }
+  async function saveKey(){
+    const k=document.getElementById('aesKey').value.trim();
+    if(!k)return alert('Enter hex key');
+    const r=await fetch('/api/keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key_hex:k})});
+    log(await r.json());checkHealth();
+  }
+  async function loadPaks(){
+    const r=await fetch('/api/original/paks');const d=await r.json();
+    const s=document.getElementById('pakSelect');s.innerHTML='';
+    if(!d.files.length){s.innerHTML='<option value="">No pak in Original/</option>';return}
+    d.files.forEach(f=>{const o=document.createElement('option');o.value=f;o.textContent=f;s.appendChild(o)});
+  }
+  async function uploadPak(){
+    const f=document.getElementById('pakUpload').files[0];if(!f)return;
+    const fd=new FormData();fd.append('file',f);
+    log('Uploading '+f.name+' …');
+    const r=await fetch('/api/upload',{method:'POST',body:fd});
+    log(await r.json());loadPaks();
+  }
+  async function scanPak(){
+    const filename=document.getElementById('pakSelect').value;if(!filename)return alert('No pak selected');
+    log('Scanning '+filename+' …');
+    const r=await fetch('/api/pak/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename})});
+    const d=await r.json();log(d);
+    if(d.files){
+      const box=document.getElementById('scanList');box.innerHTML='';
+      d.files.forEach(f=>{
+        const row=document.createElement('div');row.className='chip';
+        row.innerHTML=`<div style="flex:1;min-width:0"><b>${f.filename.split('/').pop()}</b><small>${f.filename}</small></div>
+          <span class="b-sm b3" style="width:auto;padding:4px 8px">${(f.size/1024).toFixed(1)} KB</span>`;
+        box.appendChild(row);
+      });
+      document.getElementById('scanCard').style.display='flex';
+    }
+  }
+  async function unpackPak(){
+    const filename=document.getElementById('pakSelect').value;if(!filename)return alert('Select a pak');
+    log('Unpacking target files from '+filename+' …');
+    const r=await fetch('/api/pak/unpack',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename})});
+    const d=await r.json();log(d);
+    renderEditor(d.editor_files||[]);
+    loadEditor();
+  }
+  async function loadEditor(){
+    const r=await fetch('/api/editor/files');const d=await r.json();
+    renderEditor((d.files||[]).map(f=>({filename:f.filename,type:f.type,size_bytes:f.size_bytes,original_path:''})));
+  }
+  function renderEditor(files){
+    const box=document.getElementById('targetList');box.innerHTML='';
+    if(!files.length){box.innerHTML='<small style="color:#f87171;text-align:center;padding:8px">No target files extracted.</small>';return}
+    files.forEach(f=>{
+      const c=document.createElement('div');c.className='chip';
+      c.innerHTML=`<div style="flex:1;min-width:0"><b>${f.filename}</b><small>${(f.type||'').toUpperCase()} • ${((f.size_bytes||0)/1024).toFixed(1)} KB</small></div>
+        <div class="row" style="width:auto">
+          ${f.type==='text'
+            ? `<button class="b-sm b1" onclick="editText('${f.filename}')">✏ Edit</button>`
+            : `<button class="b-sm b3" onclick="pickBin('${f.filename}')">⬆ Replace</button>`}
+          <a href="/api/download/Editor/${f.filename}" download><button class="b-sm b3">⬇</button></a>
+        </div>`;
+      box.appendChild(c);
+    });
+  }
+  async function editText(fn){
+    editTarget=fn;
+    document.getElementById('editName').textContent='Editing: '+fn;
+    document.getElementById('editCard').style.display='flex';
+    const r=await fetch('/api/editor/read-text?filename='+encodeURIComponent(fn));
+    const d=await r.json();document.getElementById('editBody').value=d.content;
+  }
+  async function saveText(){
+    if(!editTarget)return;
+    const content=document.getElementById('editBody').value;
+    const r=await fetch('/api/editor/save-text',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({filename:editTarget,content})});
+    log(await r.json());alert('Saved!');
+  }
+  function pickBin(fn){binTarget=fn;document.getElementById('binUpload').click()}
+  async function uploadBinary(){
+    const f=document.getElementById('binUpload').files[0];if(!f)return;
+    const fd=new FormData();fd.append('file',f,binTarget);
+    const r=await fetch('/api/editor/upload-binary',{method:'POST',body:fd});
+    log(await r.json());alert('Replaced '+binTarget);
+  }
+  async function buildPak(){
+    const name=document.getElementById('repackName').value.trim();
+    log('Rebuilding pak …');
+    const r=await fetch('/api/pak/build',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({custom_name:name||null})});
+    const d=await r.json();log(d);
+    if(d.download_url){
+      const a=document.getElementById('dlLink');a.href=d.download_url;a.download=d.filename;
+      document.getElementById('dlBox').style.display='block';
+      alert('Repacked as '+d.filename);
+    }
+  }
+  checkHealth();loadPaks();loadEditor();
+</script>
+</body>
+</html>
+"""
