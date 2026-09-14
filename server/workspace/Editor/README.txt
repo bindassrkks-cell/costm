@@ -1,1 +1,1 @@
-Supported editable files go here.
+Staging area for modifications.

@@ -1,1 +1,1 @@
-Original input files go here.
+Directory for original uploaded pak assets.

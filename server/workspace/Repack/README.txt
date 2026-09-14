@@ -1,1 +1,1 @@
-Generated output files go here.
+Ready-to-deliver repacked assets.

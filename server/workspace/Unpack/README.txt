@@ -1,1 +1,1 @@
-Unpacked files go here.
+Directory for extracted assets.
