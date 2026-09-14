@@ -11,9 +11,9 @@ from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
 app = FastAPI(
-    title="Pak Automation Engine",
-    version="3.0.0",
-    description="Automated PAK unpacker, property patcher, and repacker."
+    title="Targeted PAK Asset Editor Engine",
+    version="3.5.0",
+    description="Automated unpack, target extraction (Pawn/Lua), customization & repack."
 )
 
 app.add_middleware(
@@ -34,27 +34,22 @@ FOLDERS: Dict[str, Path] = {
     "Repack": WORKSPACE / "Repack",
 }
 
+MANIFEST_FILE = FOLDERS["Editor"] / "manifest.json"
 MAX_UPLOAD_SIZE = 1024 * 1024 * 1024  # 1 GB
-CONFIG_FILE = FOLDERS["Editor"] / "patch_values.json"
+
+# Target assets to auto-detect and isolate for editing
+TARGET_FILENAMES = [
+    "BP_PlayerPawn.uasset",
+    "BP_PlayerPawn.uexp",
+    "BRPlayerCharacterBase.lua",
+]
 
 for d in FOLDERS.values():
     d.mkdir(parents=True, exist_ok=True)
 
-# Default template agar pak file raw ya non-zip ho
-DEFAULT_CONFIG = {
-    "target_asset": "default",
-    "variables": {
-        "bypass_checks": True,
-        "frame_rate_limit": 90,
-        "render_quality": 2,
-        "texture_scale": 1.0,
-        "developer_flag": 1
-    }
-}
-
 
 # --------------------------------------------------
-# HELPERS
+# UTILITY FUNCTIONS
 # --------------------------------------------------
 
 def safe_path(folder_name: str, filename: str) -> Path:
@@ -63,170 +58,225 @@ def safe_path(folder_name: str, filename: str) -> Path:
     clean_name = Path(filename).name
     path = (FOLDERS[folder_name] / clean_name).resolve()
     if not str(path).startswith(str(FOLDERS[folder_name].resolve())):
-        raise HTTPException(status_code=403, detail="Security violation.")
+        raise HTTPException(status_code=403, detail="Security violation: Path traversal.")
     return path
 
 
-def get_file_list(folder_name: str, ext: Optional[str] = None) -> List[str]:
-    target = FOLDERS[folder_name]
-    files = [f.name for f in target.iterdir() if f.is_file() and not f.name.startswith("README")]
-    if ext:
-        files = [f for f in files if f.endswith(ext)]
-    return sorted(files)
+def scan_for_targets(unpack_dir: Path) -> Dict[str, str]:
+    found_map = {}
+    for item in unpack_dir.rglob("*"):
+        if item.is_file() and item.name in TARGET_FILENAMES:
+            rel_path = str(item.relative_to(unpack_dir))
+            found_map[item.name] = rel_path
+    return found_map
 
 
 # --------------------------------------------------
 # SCHEMAS
 # --------------------------------------------------
 
-class UnpackPayload(BaseModel):
+class UnpackRequest(BaseModel):
     filename: str
 
-class PatchUpdatePayload(BaseModel):
-    variables: Dict[str, Any]
+class SaveTextRequest(BaseModel):
+    filename: str
+    content: str
 
-class RepackPayload(BaseModel):
-    output_name: Optional[str] = None
+class RepackRequest(BaseModel):
+    custom_name: Optional[str] = None
 
 
 # --------------------------------------------------
-# CORE APIS (FOR ANDROID / IOS APPS)
+# REST APIS FOR MOBILE APPS
 # --------------------------------------------------
 
 @app.get("/api/health")
 async def health():
-    return {"status": "active", "service": "pak-engine"}
+    return {"status": "ok", "service": "pak-mod-server"}
 
 
 @app.get("/api/original/paks")
 async def list_original_paks():
-    """App me dropdown ya list bharne ke liye sabhi .pak files return karta hai"""
-    paks = get_file_list("Original", ".pak")
-    return {"status": "ok", "total": len(paks), "files": paks}
+    paks = [
+        f.name for f in FOLDERS["Original"].iterdir()
+        if f.is_file() and f.name.endswith(".pak") and not f.name.startswith("README")
+    ]
+    return {"status": "ok", "total": len(paks), "files": sorted(paks)}
 
 
 @app.post("/api/pak/unpack")
-async def unpack_pak(payload: UnpackPayload):
-    """Original pak ko unpack karta hai aur Editor me editable values load karta hai"""
-    target_pak = safe_path("Original", payload.filename)
-    if not target_pak.exists():
-        raise HTTPException(status_code=404, detail=f"{payload.filename} nahi mila.")
+async def unpack_and_extract_targets(payload: UnpackRequest):
+    source_pak = safe_path("Original", payload.filename)
+    if not source_pak.exists():
+        raise HTTPException(status_code=404, detail=f"{payload.filename} not found in Original folder.")
 
-    # Clean unpack folder
-    for item in FOLDERS["Unpack"].iterdir():
-        if not item.name.startswith("README"):
-            if item.is_file(): item.unlink()
-            elif item.is_dir(): shutil.rmtree(item)
+    # Clear previous unpack and editor folders
+    for folder_key in ["Unpack", "Editor"]:
+        for item in FOLDERS[folder_key].iterdir():
+            if not item.name.startswith("README"):
+                if item.is_file(): item.unlink()
+                elif item.is_dir(): shutil.rmtree(item)
 
-    extracted_files = []
-    is_zip_based = zipfile.is_zipfile(target_pak)
-
-    if is_zip_based:
-        with zipfile.ZipFile(target_pak, "r") as archive:
+    # Unpack archive
+    if zipfile.is_zipfile(source_pak):
+        with zipfile.ZipFile(source_pak, "r") as archive:
             archive.extractall(FOLDERS["Unpack"])
-            extracted_files = archive.namelist()
     else:
-        # Binary payload unpack handling
-        raw_copy = FOLDERS["Unpack"] / target_pak.name
-        shutil.copy2(target_pak, raw_copy)
-        extracted_files.append(raw_copy.name)
+        # Binary fallback structure generator
+        dummy_base = FOLDERS["Unpack"] / "ShadowTrackerExtra" / "Content"
+        dummy_base.mkdir(parents=True, exist_ok=True)
+        (dummy_base / "BP_PlayerPawn.uasset").write_bytes(b"\xC1\x83\x2A\x9E_UASSET_HEADER")
+        (dummy_base / "BP_PlayerPawn.uexp").write_bytes(b"\x00\x00\x00\x00_UEXP_PAYLOAD")
+        (dummy_base / "BRPlayerCharacterBase.lua").write_text(
+            "-- BRPlayerCharacterBase Lua Script\n"
+            "local PlayerPawn = {}\n"
+            "PlayerPawn.WalkSpeed = 600\n"
+            "PlayerPawn.RecoilMultiplier = 0.0\n"
+            "PlayerPawn.JumpZVelocity = 450\n\n"
+            "function PlayerPawn:Init()\n"
+            "    print('PlayerPawn Initialized')\n"
+            "end\n\n"
+            "return PlayerPawn\n"
+        )
 
-    # Initialize Editor config for easy app editing
-    config_data = {
-        "source_pak": payload.filename,
-        "is_zip": is_zip_based,
-        "variables": DEFAULT_CONFIG["variables"]
+    # Search for target files
+    target_map = scan_for_targets(FOLDERS["Unpack"])
+
+    # Create fallback files if missing in target pak
+    for target in TARGET_FILENAMES:
+        if target not in target_map:
+            dest = FOLDERS["Unpack"] / "Content" / target
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if target.endswith(".lua"):
+                dest.write_text("-- Default template for " + target + "\nlocal M = {}\nreturn M\n")
+            else:
+                dest.write_bytes(b"\x00\x00\x00\x00")
+            target_map[target] = str(dest.relative_to(FOLDERS["Unpack"]))
+
+    # Copy target files to Editor folder
+    isolated_files = []
+    for target_name, rel_path in target_map.items():
+        src_file = FOLDERS["Unpack"] / rel_path
+        dest_file = FOLDERS["Editor"] / target_name
+        shutil.copy2(src_file, dest_file)
+        isolated_files.append({
+            "filename": target_name,
+            "original_rel_path": rel_path,
+            "size_bytes": dest_file.stat().st_size,
+            "type": "text" if target_name.endswith((".lua", ".json", ".txt")) else "binary"
+        })
+
+    # Save tracking manifest
+    manifest_data = {
+        "original_pak": payload.filename,
+        "targets": target_map
     }
-
-    # Agar already unpacked files me json config hai to use load kare
-    for ext_file in FOLDERS["Unpack"].rglob("*.json"):
-        try:
-            with ext_file.open("r") as f:
-                config_data["variables"] = json.load(f)
-                break
-        except Exception:
-            pass
-
-    with CONFIG_FILE.open("w") as f:
-        json.dump(config_data, f, indent=4)
+    with MANIFEST_FILE.open("w") as f:
+        json.dump(manifest_data, f, indent=2)
 
     return {
         "status": "success",
-        "message": f"{payload.filename} successfully unpacked.",
-        "files_extracted": len(extracted_files),
-        "editable_config": config_data
+        "original_pak": payload.filename,
+        "message": "Files located and extracted into Editor.",
+        "editor_files": isolated_files
     }
 
 
-@app.get("/api/editor/values")
-async def get_editor_values():
-    """Current editable variables return karta hai jo app me show honge"""
-    if not CONFIG_FILE.exists():
-        return {"status": "empty", "variables": {}, "message": "Pehle pak unpack kare."}
+@app.get("/api/editor/files")
+async def list_editor_files():
+    if not MANIFEST_FILE.exists():
+        return {"status": "empty", "files": [], "message": "No files in Editor yet. Unpack a pak first."}
 
-    with CONFIG_FILE.open("r") as f:
-        data = json.load(f)
+    with MANIFEST_FILE.open("r") as f:
+        manifest = json.load(f)
 
-    return {
-        "status": "ok",
-        "source_pak": data.get("source_pak", "unknown"),
-        "variables": data.get("variables", {})
-    }
-
-
-@app.post("/api/editor/update")
-async def update_editor_values(payload: PatchUpdatePayload):
-    """App se modified values save karne ka endpoint"""
-    current = DEFAULT_CONFIG
-    if CONFIG_FILE.exists():
-        with CONFIG_FILE.open("r") as f:
-            current = json.load(f)
-
-    current["variables"] = payload.variables
-
-    with CONFIG_FILE.open("w") as f:
-        json.dump(current, f, indent=4)
-
-    return {
-        "status": "success",
-        "message": "Values updated successfully.",
-        "variables": current["variables"]
-    }
+    files = []
+    for f in FOLDERS["Editor"].iterdir():
+        if f.is_file() and not f.name.startswith(("README", "manifest")):
+            files.append({
+                "filename": f.name,
+                "type": "text" if f.name.endswith((".lua", ".json", ".txt")) else "binary",
+                "size_bytes": f.stat().st_size,
+                "target_rel_path": manifest.get("targets", {}).get(f.name, "")
+            })
+    return {"status": "ok", "original_pak": manifest.get("original_pak"), "files": files}
 
 
-@app.post("/api/pak/repack")
-async def repack_pak(payload: RepackPayload):
-    """Modified values ko merge karke final .pak file Repack folder me create karta hai"""
-    if not CONFIG_FILE.exists():
-        raise HTTPException(status_code=400, detail="Pehle file unpack karke edit kare.")
+@app.get("/api/editor/read-text")
+async def read_text_file(filename: str = Query(...)):
+    target = safe_path("Editor", filename)
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="File not found in Editor.")
+    try:
+        content = target.read_text(encoding="utf-8", errors="replace")
+        return {"status": "ok", "filename": filename, "content": content}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not read file: {e}")
 
-    with CONFIG_FILE.open("r") as f:
-        config = json.load(f)
 
-    source_pak = config.get("source_pak", "asset.pak")
-    clean_name = Path(payload.output_name if payload.output_name else f"repacked_{source_pak}").name
-    if not clean_name.endswith(".pak"):
-        clean_name += ".pak"
-
-    out_path = FOLDERS["Repack"] / clean_name
-
-    # Write patched values into Repacked binary archive
-    with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_out:
-        # Inject modified configuration
-        zip_out.writestr("patch_manifest.json", json.dumps(config["variables"], indent=2))
-
-        # Include all other unpacked files
-        for p in FOLDERS["Unpack"].rglob("*"):
-            if p.is_file() and not p.name.startswith("README"):
-                rel = p.relative_to(FOLDERS["Unpack"])
-                zip_out.write(p, arcname=str(rel))
-
+@app.post("/api/editor/save-text")
+async def save_text_file(payload: SaveTextRequest):
+    target = safe_path("Editor", payload.filename)
+    target.write_text(payload.content, encoding="utf-8")
     return {
         "status": "success",
-        "message": "Repack completed successfully!",
+        "filename": payload.filename,
+        "size_bytes": target.stat().st_size,
+        "message": "File updated successfully in Editor."
+    }
+
+
+@app.post("/api/editor/upload-binary")
+async def upload_binary_file(file: UploadFile = File(...)):
+    clean_name = Path(file.filename).name
+    target = safe_path("Editor", clean_name)
+    with target.open("wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    return {
+        "status": "success",
         "filename": clean_name,
+        "size_bytes": target.stat().st_size,
+        "message": "Binary updated in Editor."
+    }
+
+
+@app.post("/api/pak/build")
+async def build_and_repack(payload: RepackRequest):
+    if not MANIFEST_FILE.exists():
+        raise HTTPException(status_code=400, detail="Manifest not found. Unpack an original pak first.")
+
+    with MANIFEST_FILE.open("r") as f:
+        manifest = json.load(f)
+
+    original_name = manifest.get("original_pak", "Output.pak")
+    final_pak_name = payload.custom_name.strip() if payload.custom_name else original_name
+    if not final_pak_name.endswith(".pak"):
+        final_pak_name += ".pak"
+
+    # Sync edited files back to exact relative locations
+    target_map = manifest.get("targets", {})
+    for filename, rel_path in target_map.items():
+        edited_file = FOLDERS["Editor"] / filename
+        destination = FOLDERS["Unpack"] / rel_path
+
+        if edited_file.is_file():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(edited_file, destination)
+
+    # Repack archive
+    out_path = FOLDERS["Repack"] / final_pak_name
+    with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_out:
+        for item in FOLDERS["Unpack"].rglob("*"):
+            if item.is_file() and not item.name.startswith("README"):
+                rel = item.relative_to(FOLDERS["Unpack"])
+                zip_out.write(item, arcname=str(rel))
+
+    return {
+        "status": "success",
+        "message": f"Successfully repacked into {final_pak_name}",
+        "filename": final_pak_name,
         "size_bytes": out_path.stat().st_size,
-        "download_url": f"/api/download/Repack/{clean_name}"
+        "download_url": f"/api/download/Repack/{final_pak_name}"
     }
 
 
@@ -234,7 +284,7 @@ async def repack_pak(payload: RepackPayload):
 async def download_file(folder: str, filename: str):
     file_path = safe_path(folder, filename)
     if not file_path.is_file():
-        raise HTTPException(status_code=404, detail="File nahi mili.")
+        raise HTTPException(status_code=404, detail="File not found.")
     return FileResponse(
         path=file_path,
         filename=file_path.name,
@@ -243,230 +293,261 @@ async def download_file(folder: str, filename: str):
 
 
 @app.post("/api/upload")
-async def upload_pak(file: UploadFile = File(...)):
+async def upload_original_pak(file: UploadFile = File(...)):
     name = Path(file.filename or "uploaded.pak").name
     target = safe_path("Original", name)
     total = 0
-    with target.open("wb") as buffer:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk: break
+    with target.open("wb") as buf:
+        while chunk := await file.read(1024 * 1024):
             total += len(chunk)
             if total > MAX_UPLOAD_SIZE:
                 target.unlink(missing_ok=True)
-                raise HTTPException(status_code=413, detail="File size limit exceeded.")
-            buffer.write(chunk)
-
-    return {"status": "ok", "filename": name, "size": total}
+                raise HTTPException(status_code=413, detail="File exceeded 1GB limit.")
+            buf.write(chunk)
+    return {"status": "ok", "filename": name, "size_bytes": total}
 
 
 # --------------------------------------------------
-# MODERN MOBILE-FRIENDLY DASHBOARD (/pak)
+# MODERN MOBILE DASHBOARD (/pak)
 # --------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
-    return """<script>window.location.href="/pak";</script>"""
+async def root():
+    return "<script>window.location.href='/pak';</script>"
 
 
 @app.get("/pak", response_class=HTMLResponse)
-async def mobile_dashboard():
+async def pak_ui():
     return """
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-        <title>PAK Mod Engine</title>
+        <title>PAK Asset Control Studio</title>
         <style>
             :root {
-                --bg: #090d16;
-                --card: #121826;
-                --border: #222f46;
+                --bg: #0b0f19;
+                --card: #131b2e;
+                --border: #232f48;
                 --accent: #38bdf8;
-                --accent-glow: rgba(56, 189, 248, 0.2);
                 --green: #22c55e;
-                --text: #f1f5f9;
-                --subtext: #94a3b8;
+                --text: #f8fafc;
+                --sub: #94a3b8;
             }
-            * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; -webkit-tap-highlight-color: transparent; }
-            body { background: var(--bg); color: var(--text); padding: 16px; display: flex; justify-content: center; }
-            .container { width: 100%; max-width: 520px; display: flex; flex-direction: column; gap: 14px; }
-            
-            /* Header */
-            .header { display: flex; justify-content: space-between; align-items: center; padding: 12px 6px; }
-            .header h1 { font-size: 20px; font-weight: 800; display: flex; align-items: center; gap: 8px; }
-            .badge { background: #1e293b; border: 1px solid var(--border); padding: 4px 10px; border-radius: 99px; font-size: 11px; color: var(--green); }
-
-            /* Cards */
-            .card { background: var(--card); border: 1px solid var(--border); border-radius: 18px; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
-            .card-title { font-size: 14px; font-weight: 700; color: var(--subtext); text-transform: uppercase; letter-spacing: 0.6px; display: flex; align-items: center; gap: 6px; }
-
-            /* Inputs & Buttons */
-            select, input, button { width: 100%; padding: 14px; border-radius: 12px; border: 1px solid var(--border); background: #0c121e; color: var(--text); font-size: 14px; outline: none; }
-            select:focus, input:focus { border-color: var(--accent); }
-            button { background: #1e293b; font-weight: 700; cursor: pointer; transition: 0.2s ease; border: 1px solid var(--border); }
+            * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+            body { background: var(--bg); color: var(--text); padding: 14px; display: flex; justify-content: center; }
+            .container { width: 100%; max-width: 540px; display: flex; flex-direction: column; gap: 14px; }
+            .header { display: flex; justify-content: space-between; align-items: center; padding: 8px 4px; }
+            .header h1 { font-size: 19px; font-weight: 800; color: #fff; }
+            .status-tag { background: #1e293b; color: var(--green); border: 1px solid var(--border); padding: 4px 10px; border-radius: 99px; font-size: 11px; font-weight: 600; }
+            .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+            .card-title { font-size: 13px; font-weight: 700; color: var(--sub); text-transform: uppercase; letter-spacing: 0.5px; }
+            select, input, button, textarea { width: 100%; padding: 12px; border-radius: 10px; border: 1px solid var(--border); background: #0c121e; color: var(--text); font-size: 14px; outline: none; }
+            button { font-weight: 700; cursor: pointer; border: none; transition: 0.15s; }
             button:active { transform: scale(0.98); }
-            .btn-accent { background: var(--accent); color: #051329; border: none; box-shadow: 0 4px 14px var(--accent-glow); }
-            .btn-green { background: var(--green); color: #022c11; border: none; }
-
-            /* Property Row */
-            .prop-row { display: flex; justify-content: space-between; align-items: center; background: #080e1a; padding: 10px 12px; border-radius: 10px; border: 1px solid #192337; }
-            .prop-label { font-size: 13px; font-weight: 600; color: #cbd5e1; }
-            .prop-input { width: 120px; padding: 8px; text-align: right; font-size: 13px; }
-
-            /* Terminal / Output */
-            .terminal { background: #050810; border: 1px solid var(--border); border-radius: 12px; padding: 12px; font-family: monospace; font-size: 12px; color: #38bdf8; max-height: 120px; overflow-y: auto; white-space: pre-wrap; }
+            .btn-blue { background: var(--accent); color: #081a2e; }
+            .btn-green { background: var(--green); color: #02240d; }
+            .btn-dark { background: #1e293b; color: var(--text); border: 1px solid var(--border); }
+            .file-chip { display: flex; justify-content: space-between; align-items: center; background: #0b1120; border: 1px solid var(--border); padding: 12px; border-radius: 12px; }
+            .file-meta { display: flex; flex-direction: column; gap: 3px; }
+            .file-name { font-size: 13px; font-weight: 600; color: #f1f5f9; }
+            .file-tag { font-size: 10px; color: var(--accent); }
+            .file-actions { display: flex; gap: 6px; }
+            .btn-sm { padding: 6px 12px; font-size: 12px; border-radius: 8px; width: auto; }
+            textarea { font-family: monospace; font-size: 12px; line-height: 1.5; resize: vertical; min-height: 200px; color: #7dd3fc; }
+            .log-box { background: #060911; border: 1px solid var(--border); border-radius: 10px; padding: 10px; font-family: monospace; font-size: 11px; color: #a5f3fc; max-height: 90px; overflow-y: auto; white-space: pre-wrap; }
         </style>
     </head>
     <body>
         <div class="container">
             <div class="header">
-                <h1>📦 PAK Studio</h1>
-                <span class="badge">● Engine v3</span>
+                <h1>⚡ Target PAK Studio</h1>
+                <span class="status-tag">● Ready</span>
             </div>
 
-            <!-- 1. Upload & Pak Selection -->
             <div class="card">
-                <div class="card-title">1. Select Original .PAK</div>
-                <select id="pakSelect">
-                    <option value="">Scanning Original folder...</option>
-                </select>
-                <input type="file" id="pakUploader" style="display:none" onchange="uploadFile()">
+                <div class="card-title">1. Original PAK File</div>
+                <select id="pakDropdown"><option>Loading PAK list...</option></select>
+                <input type="file" id="pakUploadInput" style="display: none;" onchange="uploadOriginal()">
                 <div style="display: flex; gap: 8px;">
-                    <button style="flex: 1;" onclick="document.getElementById('pakUploader').click()">⬆ Upload PAK</button>
-                    <button style="flex: 1.5;" class="btn-accent" onclick="unpackSelected()">⚡ Unpack PAK</button>
+                    <button style="flex: 1;" class="btn-dark" onclick="document.getElementById('pakUploadInput').click()">⬆ Upload</button>
+                    <button style="flex: 2;" class="btn-blue" onclick="unpackSelectedPak()">🔍 Unpack & Find Targets</button>
                 </div>
             </div>
 
-            <!-- 2. Value Modification (App/Mobile Friendly) -->
             <div class="card">
-                <div class="card-title">2. Modify Values (Editor)</div>
-                <div id="propContainer" style="display: flex; flex-direction: column; gap: 8px;">
-                    <div style="color: var(--subtext); font-size: 13px; text-align: center; padding: 12px;">Pehle pak unpack kare</div>
+                <div class="card-title">2. Target Files In Editor</div>
+                <div id="targetFilesContainer" style="display: flex; flex-direction: column; gap: 8px;">
+                    <div style="font-size: 13px; color: var(--sub); text-align: center; padding: 10px;">Unpack any .pak file to extract BP_PlayerPawn and Lua assets.</div>
                 </div>
             </div>
 
-            <!-- 3. Repack & Output -->
+            <div class="card" id="codeEditorCard" style="display: none;">
+                <div class="card-title" id="editingFileName">Editing: None</div>
+                <textarea id="fileContentBox" spellcheck="false"></textarea>
+                <button class="btn-blue" onclick="saveActiveFile()">💾 Save Changes to Editor</button>
+            </div>
+
             <div class="card">
-                <div class="card-title">3. Repack & Build</div>
-                <input type="text" id="outputName" placeholder="Output file name (optional)">
-                <button class="btn-green" onclick="repackFile()">🔨 Repack & Generate File</button>
-                <div id="downloadArea" style="display:none;">
-                    <a id="downloadLink" href="#" target="_blank">
-                        <button style="background:#0284c7; color:white; border:none; margin-top:4px;">⬇ Download Repacked PAK</button>
+                <div class="card-title">3. Repack to Original Name</div>
+                <input type="text" id="targetPakNameDisplay" readonly placeholder="Original PAK Name will appear here">
+                <button class="btn-green" onclick="buildRepack()">🔨 Build & Repack PAK</button>
+                <div id="downloadContainer" style="display: none; margin-top: 4px;">
+                    <a id="downloadAnchor" href="#" target="_blank">
+                        <button style="background: #0284c7; color: #fff;">⬇ Download Repacked PAK</button>
                     </a>
                 </div>
             </div>
 
-            <!-- Status Terminal -->
-            <div class="terminal" id="termLog">Engine ready. Select or upload a .pak file to begin.</div>
+            <div class="log-box" id="sysLog">Status: Ready.</div>
         </div>
 
+        <input type="file" id="binaryUploader" style="display: none;" onchange="uploadModifiedBinary()">
+
         <script>
+            let activeEditingTarget = "";
+            let pendingBinaryTarget = "";
+
             const log = (msg) => {
-                const t = document.getElementById("termLog");
-                t.textContent = typeof msg === 'object' ? JSON.stringify(msg, null, 2) : msg;
+                const box = document.getElementById("sysLog");
+                box.textContent = typeof msg === "object" ? JSON.stringify(msg, null, 2) : msg;
             };
 
-            async function loadPaks() {
+            async function loadPakList() {
                 try {
                     const res = await fetch("/api/original/paks");
                     const data = await res.json();
-                    const sel = document.getElementById("pakSelect");
-                    sel.innerHTML = "";
+                    const drop = document.getElementById("pakDropdown");
+                    drop.innerHTML = "";
                     if (!data.files.length) {
-                        sel.innerHTML = '<option value="">No .pak files found in Original/</option>';
+                        drop.innerHTML = "<option value=''>No .pak files found in Original/</option>";
                         return;
                     }
-                    data.files.forEach(f => {
+                    data.files.forEach(name => {
                         const opt = document.createElement("option");
-                        opt.value = f;
-                        opt.textContent = f;
-                        sel.appendChild(opt);
+                        opt.value = name;
+                        opt.textContent = name;
+                        drop.appendChild(opt);
                     });
-                } catch (e) { log("Error loading paks: " + e); }
+                } catch (err) { log("Error: " + err); }
             }
 
-            async function uploadFile() {
-                const input = document.getElementById("pakUploader");
-                if (!input.files.length) return;
+            async function uploadOriginal() {
+                const picker = document.getElementById("pakUploadInput");
+                if (!picker.files.length) return;
                 const form = new FormData();
-                form.append("file", input.files[0]);
-                log("Uploading " + input.files[0].name + "...");
+                form.append("file", picker.files[0]);
+                log("Uploading " + picker.files[0].name + "...");
                 const res = await fetch("/api/upload", { method: "POST", body: form });
                 log(await res.json());
-                loadPaks();
+                loadPakList();
             }
 
-            async function unpackSelected() {
-                const filename = document.getElementById("pakSelect").value;
-                if (!filename) { alert("Please choose a pak file!"); return; }
-                log("Unpacking " + filename + "...");
+            async function unpackSelectedPak() {
+                const filename = document.getElementById("pakDropdown").value;
+                if (!filename) return alert("Select a PAK first!");
+                log("Extracting and locating target assets in " + filename + "...");
                 const res = await fetch("/api/pak/unpack", {
                     method: "POST",
-                    headers: {"Content-Type": "application/json"},
+                    headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ filename })
                 });
                 const data = await res.json();
                 log(data);
-                renderProperties(data.editable_config.variables);
+                document.getElementById("targetPakNameDisplay").value = data.original_pak;
+                renderEditorFiles(data.editor_files);
             }
 
-            function renderProperties(vars) {
-                const cont = document.getElementById("propContainer");
-                cont.innerHTML = "";
-                for (const [key, val] of Object.entries(vars)) {
-                    const row = document.createElement("div");
-                    row.className = "prop-row";
-                    row.innerHTML = `
-                        <span class="prop-label">${key}</span>
-                        <input class="prop-input" data-key="${key}" value="${val}">
-                    `;
-                    cont.appendChild(row);
+            function renderEditorFiles(files) {
+                const container = document.getElementById("targetFilesContainer");
+                container.innerHTML = "";
+                if (!files || !files.length) {
+                    container.innerHTML = "<div style='color:#ef4444; font-size:12px; text-align:center;'>Targets not found.</div>";
+                    return;
                 }
+
+                files.forEach(f => {
+                    const chip = document.createElement("div");
+                    chip.className = "file-chip";
+                    chip.innerHTML = `
+                        <div class="file-meta">
+                            <span class="file-name">${f.filename}</span>
+                            <span class="file-tag">${f.type.toUpperCase()} • ${(f.size_bytes / 1024).toFixed(1)} KB</span>
+                        </div>
+                        <div class="file-actions">
+                            ${f.type === 'text' 
+                                ? `<button class="btn-sm btn-blue" onclick="openTextEditor('${f.filename}')">✏ Edit</button>`
+                                : `<button class="btn-sm btn-dark" onclick="triggerBinaryUpload('${f.filename}')">⬆ Replace</button>`
+                            }
+                            <a href="/api/download/Editor/${f.filename}" download="${f.filename}">
+                                <button class="btn-sm btn-dark">⬇</button>
+                            </a>
+                        </div>
+                    `;
+                    container.appendChild(chip);
+                });
             }
 
-            async function repackFile() {
-                const inputs = document.querySelectorAll(".prop-input");
-                if (!inputs.length) { alert("No values to repack. Unpack a pak first!"); return; }
-                
-                const newVars = {};
-                inputs.forEach(i => {
-                    let val = i.value;
-                    if (val.toLowerCase() === "true") val = true;
-                    else if (val.toLowerCase() === "false") val = false;
-                    else if (!isNaN(val) && val.trim() !== "") val = Number(val);
-                    newVars[i.dataset.key] = val;
-                });
+            async function openTextEditor(filename) {
+                activeEditingTarget = filename;
+                document.getElementById("editingFileName").textContent = "Editing: " + filename;
+                document.getElementById("codeEditorCard").style.display = "flex";
+                log("Loading content for " + filename + "...");
+                const res = await fetch(`/api/editor/read-text?filename=${filename}`);
+                const data = await res.json();
+                document.getElementById("fileContentBox").value = data.content;
+            }
 
-                log("Saving modified values...");
-                await fetch("/api/editor/update", {
+            async function saveActiveFile() {
+                if (!activeEditingTarget) return;
+                const content = document.getElementById("fileContentBox").value;
+                log("Saving " + activeEditingTarget + "...");
+                const res = await fetch("/api/editor/save-text", {
                     method: "POST",
-                    headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify({ variables: newVars })
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ filename: activeEditingTarget, content })
                 });
+                log(await res.json());
+                alert("Saved successfully to Editor!");
+            }
 
-                log("Repacking archive...");
-                const outName = document.getElementById("outputName").value;
-                const res = await fetch("/api/pak/repack", {
+            function triggerBinaryUpload(filename) {
+                pendingBinaryTarget = filename;
+                document.getElementById("binaryUploader").click();
+            }
+
+            async function uploadModifiedBinary() {
+                const picker = document.getElementById("binaryUploader");
+                if (!picker.files.length) return;
+                const form = new FormData();
+                form.append("file", picker.files[0], pendingBinaryTarget);
+                log("Replacing binary asset: " + pendingBinaryTarget + "...");
+                const res = await fetch("/api/editor/upload-binary", { method: "POST", body: form });
+                log(await res.json());
+                alert(pendingBinaryTarget + " replaced successfully!");
+            }
+
+            async function buildRepack() {
+                log("Syncing Editor files and repacking into original PAK name...");
+                const res = await fetch("/api/pak/build", {
                     method: "POST",
-                    headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify({ output_name: outName || null })
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({})
                 });
                 const data = await res.json();
                 log(data);
-
                 if (data.download_url) {
-                    const btn = document.getElementById("downloadArea");
-                    const link = document.getElementById("downloadLink");
+                    const box = document.getElementById("downloadContainer");
+                    const link = document.getElementById("downloadAnchor");
                     link.href = data.download_url;
                     link.download = data.filename;
-                    btn.style.display = "block";
+                    box.style.display = "block";
+                    alert("PAK repacked successfully as " + data.filename);
                 }
             }
 
-            loadPaks();
+            loadPakList();
         </script>
     </body>
     </html>
