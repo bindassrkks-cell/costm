@@ -1,1 +1,1 @@
-Ready-to-deliver repacked assets.
+Compiled output pak binaries.

@@ -1,1 +1,1 @@
-Directory for original uploaded pak assets.
+Place input .pak assets here.

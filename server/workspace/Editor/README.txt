@@ -1,1 +1,1 @@
-Staging area for modifications.
+Editable parameters and staged items.

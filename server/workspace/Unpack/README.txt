@@ -1,1 +1,1 @@
-Directory for extracted assets.
+Extracted content directory.
